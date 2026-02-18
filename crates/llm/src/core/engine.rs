@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 use crate::utils::config::EngineConfig;
+use crate::utils::kvcache_allocator::{KVCacheAllocator, KVCachePlan};
 use crate::utils::tokenizer::{
     ModelConfig, decode_tokens, encode_prompt, load_model_config, load_tokenizer,
     load_tokenizer_config, resolve_eos_id,
@@ -13,6 +14,7 @@ pub struct Engine {
     pub config: EngineConfig,
     pub model_config: ModelConfig,
     pub tokenizer: Tokenizer,
+    pub kv_cache_plan: KVCachePlan,
 }
 
 impl Engine {
@@ -34,6 +36,13 @@ impl Engine {
             config.max_num_batched_tokens >= config.max_model_len,
             "max_num_batched_tokens must be >= clamped max_model_len"
         );
+        let allocator = KVCacheAllocator::new(&config, &model_config)?;
+        let kv_cache_plan = allocator.plan_auto()?;
+        KVCacheAllocator::apply_plan(&mut config, &kv_cache_plan);
+        ensure!(
+            config.max_num_batched_tokens >= config.max_model_len,
+            "max_num_batched_tokens must be >= max_model_len after kv cache planning"
+        );
 
         let tokenizer = load_tokenizer(&model_dir)?;
         let tokenizer_config = load_tokenizer_config(&model_dir)?;
@@ -43,6 +52,7 @@ impl Engine {
             config,
             model_config,
             tokenizer,
+            kv_cache_plan,
         })
     }
 

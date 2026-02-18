@@ -7,6 +7,13 @@ use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ModelConfig {
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub hidden_size: usize,
+    #[serde(default)]
+    pub num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    pub head_dim: Option<usize>,
     pub max_position_embeddings: usize,
     #[serde(default)]
     pub architectures: Vec<String>,
