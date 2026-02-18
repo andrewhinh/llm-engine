@@ -1,0 +1,492 @@
+use anyhow::{Result, ensure};
+use candle_core::{DType, Device, Tensor};
+use candle_nn::ops::sigmoid;
+
+use crate::models::layers::{
+    Attention, KvCache, Linear, LmHead, RmsNorm, RotaryEmbedding, VocabEmbedding,
+};
+use crate::utils::tokenizer::ModelConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedShard {
+    Q,
+    K,
+    V,
+    Gate,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedModuleMapping {
+    pub source_fragment: &'static str,
+    pub packed_module: &'static str,
+    pub shard: PackedShard,
+}
+
+const PACKED_MODULES: [PackedModuleMapping; 5] = [
+    PackedModuleMapping {
+        source_fragment: "q_proj",
+        packed_module: "qkv_proj",
+        shard: PackedShard::Q,
+    },
+    PackedModuleMapping {
+        source_fragment: "k_proj",
+        packed_module: "qkv_proj",
+        shard: PackedShard::K,
+    },
+    PackedModuleMapping {
+        source_fragment: "v_proj",
+        packed_module: "qkv_proj",
+        shard: PackedShard::V,
+    },
+    PackedModuleMapping {
+        source_fragment: "gate_proj",
+        packed_module: "gate_up_proj",
+        shard: PackedShard::Gate,
+    },
+    PackedModuleMapping {
+        source_fragment: "up_proj",
+        packed_module: "gate_up_proj",
+        shard: PackedShard::Up,
+    },
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen3Config {
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub max_position_embeddings: usize,
+    pub tie_word_embeddings: bool,
+    pub attention_bias: bool,
+    pub hidden_act: String,
+}
+
+impl Qwen3Config {
+    pub fn from_model_config(model_config: &ModelConfig) -> Result<Self> {
+        ensure!(model_config.hidden_size > 0, "hidden_size must be positive");
+        ensure!(
+            model_config.num_attention_heads > 0,
+            "num_attention_heads must be positive"
+        );
+        ensure!(
+            model_config.num_hidden_layers > 0,
+            "num_hidden_layers must be positive"
+        );
+        ensure!(model_config.vocab_size > 0, "vocab_size must be positive");
+
+        let num_key_value_heads = model_config
+            .num_key_value_heads
+            .unwrap_or(model_config.num_attention_heads);
+        ensure!(
+            num_key_value_heads > 0,
+            "num_key_value_heads must be positive"
+        );
+        ensure!(
+            model_config
+                .num_attention_heads
+                .is_multiple_of(num_key_value_heads),
+            "num_attention_heads must be divisible by num_key_value_heads"
+        );
+
+        let head_dim = model_config
+            .head_dim
+            .unwrap_or_else(|| model_config.hidden_size / model_config.num_attention_heads);
+        ensure!(head_dim > 0, "head_dim must be positive");
+        ensure!(
+            model_config.hidden_size == model_config.num_attention_heads * head_dim,
+            "hidden_size must equal num_attention_heads * head_dim"
+        );
+
+        let intermediate_size = model_config
+            .intermediate_size
+            .unwrap_or(model_config.hidden_size * 4);
+        ensure!(intermediate_size > 0, "intermediate_size must be positive");
+        ensure!(
+            model_config.hidden_act == "silu",
+            "only silu hidden_act is supported for qwen3 currently"
+        );
+
+        Ok(Self {
+            hidden_size: model_config.hidden_size,
+            num_attention_heads: model_config.num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            intermediate_size,
+            num_hidden_layers: model_config.num_hidden_layers,
+            vocab_size: model_config.vocab_size,
+            rms_norm_eps: model_config.rms_norm_eps,
+            rope_theta: model_config.rope_theta,
+            max_position_embeddings: model_config.max_position_embeddings,
+            tie_word_embeddings: model_config.tie_word_embeddings,
+            attention_bias: model_config.attention_bias,
+            hidden_act: model_config.hidden_act.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
+    rotary: RotaryEmbedding,
+    attn: Attention,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+}
+
+impl Qwen3Attention {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+        let q_out = config.num_attention_heads * config.head_dim;
+        let kv_out = config.num_key_value_heads * config.head_dim;
+
+        let q_proj = Linear::zeros(
+            config.hidden_size,
+            q_out,
+            config.attention_bias,
+            dtype,
+            device,
+        )?;
+        let k_proj = Linear::zeros(
+            config.hidden_size,
+            kv_out,
+            config.attention_bias,
+            dtype,
+            device,
+        )?;
+        let v_proj = Linear::zeros(
+            config.hidden_size,
+            kv_out,
+            config.attention_bias,
+            dtype,
+            device,
+        )?;
+        let o_proj = Linear::zeros(config.hidden_size, config.hidden_size, false, dtype, device)?;
+
+        let q_norm = if config.attention_bias {
+            None
+        } else {
+            Some(RmsNorm::ones(
+                config.head_dim,
+                config.rms_norm_eps,
+                dtype,
+                device,
+            )?)
+        };
+        let k_norm = if config.attention_bias {
+            None
+        } else {
+            Some(RmsNorm::ones(
+                config.head_dim,
+                config.rms_norm_eps,
+                dtype,
+                device,
+            )?)
+        };
+
+        let rotary = RotaryEmbedding::new(
+            config.head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+            device,
+        )?;
+        let attn = Attention::new(
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+        )?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            rotary,
+            attn,
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+        })
+    }
+
+    fn forward(
+        &self,
+        positions: &Tensor,
+        hidden_states: &Tensor,
+        slot_mapping: Option<&[i32]>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<Tensor> {
+        let tokens = hidden_states.dims2()?.0;
+        let mut q =
+            self.q_proj
+                .forward(hidden_states)?
+                .reshape((tokens, self.num_heads, self.head_dim))?;
+        let mut k = self.k_proj.forward(hidden_states)?.reshape((
+            tokens,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+        let v = self.v_proj.forward(hidden_states)?.reshape((
+            tokens,
+            self.num_kv_heads,
+            self.head_dim,
+        ))?;
+
+        if let Some(q_norm) = &self.q_norm {
+            q = q_norm.forward(&q)?;
+        }
+        if let Some(k_norm) = &self.k_norm {
+            k = k_norm.forward(&k)?;
+        }
+
+        let (q, k) = self.rotary.forward(positions, &q, &k)?;
+        if let (Some(slot_mapping), Some(cache)) = (slot_mapping, kv_cache) {
+            self.attn.write_kv_cache(&k, &v, slot_mapping, cache)?;
+        }
+
+        let out = self.attn.forward_prefill(&q, &k, &v, true)?;
+        Ok(self
+            .o_proj
+            .forward(&out.reshape((tokens, self.num_heads * self.head_dim))?)?)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Mlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl Qwen3Mlp {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+        Ok(Self {
+            gate_proj: Linear::zeros(
+                config.hidden_size,
+                config.intermediate_size,
+                false,
+                dtype,
+                device,
+            )?,
+            up_proj: Linear::zeros(
+                config.hidden_size,
+                config.intermediate_size,
+                false,
+                dtype,
+                device,
+            )?,
+            down_proj: Linear::zeros(
+                config.intermediate_size,
+                config.hidden_size,
+                false,
+                dtype,
+                device,
+            )?,
+        })
+    }
+
+    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(hidden_states)?;
+        let up = self.up_proj.forward(hidden_states)?;
+        let gated = gate.broadcast_mul(&sigmoid(&gate)?)?;
+        Ok(self.down_proj.forward(&gated.broadcast_mul(&up)?)?)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3DecoderLayer {
+    self_attn: Qwen3Attention,
+    mlp: Qwen3Mlp,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
+}
+
+impl Qwen3DecoderLayer {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+        Ok(Self {
+            self_attn: Qwen3Attention::zeros(config, dtype, device)?,
+            mlp: Qwen3Mlp::zeros(config, dtype, device)?,
+            input_layernorm: RmsNorm::ones(config.hidden_size, config.rms_norm_eps, dtype, device)?,
+            post_attention_layernorm: RmsNorm::ones(
+                config.hidden_size,
+                config.rms_norm_eps,
+                dtype,
+                device,
+            )?,
+        })
+    }
+
+    fn forward(
+        &self,
+        positions: &Tensor,
+        hidden_states: &Tensor,
+        residual: Option<&Tensor>,
+        slot_mapping: Option<&[i32]>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (input_norm, input_residual) = if let Some(residual) = residual {
+            self.input_layernorm
+                .forward_with_residual(hidden_states, residual)?
+        } else {
+            let residual = hidden_states.clone();
+            let normed = self.input_layernorm.forward(hidden_states)?;
+            (normed, residual)
+        };
+
+        let attn_out = self
+            .self_attn
+            .forward(positions, &input_norm, slot_mapping, kv_cache)?;
+        let (post_norm, post_residual) = self
+            .post_attention_layernorm
+            .forward_with_residual(&attn_out, &input_residual)?;
+        let mlp_out = self.mlp.forward(&post_norm)?;
+        Ok((mlp_out, post_residual))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Model {
+    embed_tokens: VocabEmbedding,
+    layers: Vec<Qwen3DecoderLayer>,
+    norm: RmsNorm,
+}
+
+impl Qwen3Model {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            layers.push(Qwen3DecoderLayer::zeros(config, dtype, device)?);
+        }
+        Ok(Self {
+            embed_tokens: VocabEmbedding::zeros(
+                config.vocab_size,
+                config.hidden_size,
+                dtype,
+                device,
+            )?,
+            layers,
+            norm: RmsNorm::ones(config.hidden_size, config.rms_norm_eps, dtype, device)?,
+        })
+    }
+
+    fn forward_hidden(
+        &self,
+        positions: &Tensor,
+        input_ids: &Tensor,
+        slot_mapping: Option<&[i32]>,
+        mut kv_cache: Option<&mut KvCache>,
+    ) -> Result<Tensor> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let mut residual: Option<Tensor> = None;
+        for layer in &self.layers {
+            let (next_hidden, next_residual) = layer.forward(
+                positions,
+                &hidden_states,
+                residual.as_ref(),
+                slot_mapping,
+                kv_cache.as_deref_mut(),
+            )?;
+            hidden_states = next_hidden;
+            residual = Some(next_residual);
+        }
+
+        if let Some(residual) = residual.as_ref() {
+            let (normed, _) = self.norm.forward_with_residual(&hidden_states, residual)?;
+            Ok(normed)
+        } else {
+            Ok(self.norm.forward(&hidden_states)?)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3ForCausalLM {
+    config: Qwen3Config,
+    model: Qwen3Model,
+    lm_head: LmHead,
+}
+
+impl Qwen3ForCausalLM {
+    pub fn zeros(config: Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+        let model = Qwen3Model::zeros(&config, dtype, device)?;
+        let lm_head = if config.tie_word_embeddings {
+            LmHead::new(model.embed_tokens.weight().clone())
+        } else {
+            LmHead::zeros(config.hidden_size, config.vocab_size, dtype, device)?
+        };
+        Ok(Self {
+            config,
+            model,
+            lm_head,
+        })
+    }
+
+    pub fn from_model_config(
+        model_config: &ModelConfig,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Self> {
+        let config = Qwen3Config::from_model_config(model_config)?;
+        Self::zeros(config, dtype, device)
+    }
+
+    pub fn packed_modules_mapping() -> &'static [PackedModuleMapping] {
+        &PACKED_MODULES
+    }
+
+    pub fn packed_module_for(weight_name: &str) -> Option<PackedModuleMapping> {
+        Self::packed_modules_mapping()
+            .iter()
+            .copied()
+            .find(|mapping| weight_name.contains(mapping.source_fragment))
+    }
+
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        slot_mapping: Option<&[i32]>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<Tensor> {
+        let tokens = input_ids.dims1()?;
+        ensure!(tokens > 0, "input_ids must not be empty");
+        ensure!(
+            positions.dims1()? == tokens,
+            "positions must have one entry per token"
+        );
+        self.model
+            .forward_hidden(positions, input_ids, slot_mapping, kv_cache)
+    }
+
+    pub fn compute_logits(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden_states)
+    }
+
+    pub fn forward_logits(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        slot_mapping: Option<&[i32]>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<Tensor> {
+        let hidden = self.forward_hidden(input_ids, positions, slot_mapping, kv_cache)?;
+        self.compute_logits(&hidden)
+    }
+
+    pub fn config(&self) -> &Qwen3Config {
+        &self.config
+    }
+}

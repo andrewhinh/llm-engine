@@ -48,12 +48,21 @@ impl RotaryEmbedding {
         key: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         ensure!(
-            query.dims() == key.dims(),
-            "query and key shapes must match for rotary embedding"
+            query.rank() == 3,
+            "query must be rank-3 [tokens, heads, dim]"
+        );
+        ensure!(key.rank() == 3, "key must be rank-3 [tokens, heads, dim]");
+        ensure!(
+            query.dim(0)? == key.dim(0)?,
+            "query and key token dims must match for rotary embedding"
         );
         ensure!(
             query.dim(D::Minus1)? == self.head_dim,
-            "query/key last dim must match rotary head_dim"
+            "query last dim must match rotary head_dim"
+        );
+        ensure!(
+            key.dim(D::Minus1)? == self.head_dim,
+            "key last dim must match rotary head_dim"
         );
         let cos = self.cos.index_select(positions, 0)?.unsqueeze(1)?;
         let sin = self.sin.index_select(positions, 0)?.unsqueeze(1)?;

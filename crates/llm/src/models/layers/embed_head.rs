@@ -32,6 +32,10 @@ impl VocabEmbedding {
         let ids = input_ids.to_dtype(DType::U32)?;
         Ok(self.weight.index_select(&ids, 0)?)
     }
+
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
 }
 
 #[derive(Debug, Clone)]

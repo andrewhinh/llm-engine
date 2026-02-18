@@ -7,6 +7,7 @@ use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ModelConfig {
+    pub vocab_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub hidden_size: usize,
@@ -14,9 +15,33 @@ pub struct ModelConfig {
     pub num_key_value_heads: Option<usize>,
     #[serde(default)]
     pub head_dim: Option<usize>,
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f64,
+    #[serde(default = "default_hidden_act")]
+    pub hidden_act: String,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub attention_bias: bool,
     pub max_position_embeddings: usize,
     #[serde(default)]
     pub architectures: Vec<String>,
+}
+
+const fn default_rms_norm_eps() -> f64 {
+    1e-6
+}
+
+fn default_hidden_act() -> String {
+    "silu".to_string()
+}
+
+const fn default_rope_theta() -> f64 {
+    10000.0
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

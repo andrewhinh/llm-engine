@@ -131,14 +131,14 @@ impl Attention {
             "key/value head count mismatch"
         );
         ensure!(kv_dim == self.head_dim, "key/value head_dim mismatch");
-        ensure!(
-            self.num_heads == self.num_kv_heads,
-            "grouped-query attention is not enabled yet"
-        );
 
         let q = query.transpose(0, 1)?.contiguous()?;
-        let k = key.transpose(0, 1)?.contiguous()?;
-        let v = value.transpose(0, 1)?.contiguous()?;
+        let k = expand_kv_heads(key, self.num_heads)?
+            .transpose(0, 1)?
+            .contiguous()?;
+        let v = expand_kv_heads(value, self.num_heads)?
+            .transpose(0, 1)?
+            .contiguous()?;
 
         let mut scores = q
             .matmul(&k.transpose(1, 2)?)?
@@ -164,4 +164,27 @@ fn apply_causal_mask(scores: Tensor) -> Result<Tensor> {
     let bias = Tensor::from_vec(mask, (1, q_tokens, k_tokens), scores.device())?
         .broadcast_as((heads, q_tokens, k_tokens))?;
     Ok(scores.broadcast_add(&bias)?)
+}
+
+fn expand_kv_heads(kv: &Tensor, target_heads: usize) -> Result<Tensor> {
+    let (_, kv_heads, _) = kv.dims3()?;
+    if kv_heads == target_heads {
+        return Ok(kv.clone());
+    }
+    ensure!(kv_heads > 0, "kv heads must be positive");
+    ensure!(
+        target_heads.is_multiple_of(kv_heads),
+        "target_heads must be divisible by kv_heads"
+    );
+
+    let repeat_factor = target_heads / kv_heads;
+    let mut repeated_heads = Vec::with_capacity(target_heads);
+    for head_idx in 0..kv_heads {
+        let head = kv.narrow(1, head_idx, 1)?;
+        for _ in 0..repeat_factor {
+            repeated_heads.push(head.clone());
+        }
+    }
+    let refs: Vec<&Tensor> = repeated_heads.iter().collect();
+    Ok(Tensor::cat(&refs, 1)?)
 }
