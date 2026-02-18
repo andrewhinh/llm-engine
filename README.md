@@ -25,7 +25,7 @@ cargo run
 ## Roadmap
 
 - [x] crate layout and deps
-- [ ] config and sampling param types
+- [x] config and sampling param types
 - [ ] tokenizer wrapper
 - [ ] sequence/request state machine
 - [ ] kv cache allocator and block manager
