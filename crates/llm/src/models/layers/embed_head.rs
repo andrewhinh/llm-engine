@@ -36,6 +36,21 @@ impl VocabEmbedding {
     pub fn weight(&self) -> &Tensor {
         &self.weight
     }
+
+    pub fn set_weight(&mut self, weight: Tensor) -> Result<()> {
+        ensure!(
+            weight.dims() == self.weight.dims(),
+            "embedding weight shape mismatch: expected {:?}, got {:?}",
+            self.weight.dims(),
+            weight.dims()
+        );
+        let mut weight = weight.to_device(self.weight.device())?;
+        if weight.dtype() != self.weight.dtype() {
+            weight = weight.to_dtype(self.weight.dtype())?;
+        }
+        self.weight = weight;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,5 +89,10 @@ impl LmHead {
             hidden_states.clone()
         };
         Ok(self.proj.forward(&hidden_states)?)
+    }
+
+    pub fn set_weight(&mut self, weight: Tensor) -> Result<()> {
+        self.proj.set_weight(weight)?;
+        Ok(())
     }
 }

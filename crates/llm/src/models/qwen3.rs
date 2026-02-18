@@ -51,6 +51,15 @@ const PACKED_MODULES: [PackedModuleMapping; 5] = [
     },
 ];
 
+fn parse_layer_path(name: &str) -> Option<(usize, &str)> {
+    let rest = name
+        .strip_prefix("model.layers.")
+        .or_else(|| name.strip_prefix("layers."))?;
+    let (layer_idx, tail) = rest.split_once('.')?;
+    let layer_idx = layer_idx.parse::<usize>().ok()?;
+    Some((layer_idx, tail))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen3Config {
     pub hidden_size: usize,
@@ -222,6 +231,53 @@ impl Qwen3Attention {
         })
     }
 
+    fn load_weight(&mut self, name: &str, tensor: &Tensor) -> Result<bool> {
+        match name {
+            "q_proj.weight" => self.q_proj.set_weight(tensor.clone())?,
+            "q_proj.bias" => self.q_proj.set_bias(tensor.clone())?,
+            "k_proj.weight" => self.k_proj.set_weight(tensor.clone())?,
+            "k_proj.bias" => self.k_proj.set_bias(tensor.clone())?,
+            "v_proj.weight" => self.v_proj.set_weight(tensor.clone())?,
+            "v_proj.bias" => self.v_proj.set_bias(tensor.clone())?,
+            "o_proj.weight" => self.o_proj.set_weight(tensor.clone())?,
+            "o_proj.bias" => self.o_proj.set_bias(tensor.clone())?,
+            "q_norm.weight" => {
+                if let Some(norm) = &mut self.q_norm {
+                    norm.set_weight(tensor.clone())?;
+                } else {
+                    return Ok(false);
+                }
+            }
+            "k_norm.weight" => {
+                if let Some(norm) = &mut self.k_norm {
+                    norm.set_weight(tensor.clone())?;
+                } else {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn load_qkv_packed_shard(
+        &mut self,
+        packed_name: &str,
+        shard: PackedShard,
+        tensor: &Tensor,
+    ) -> Result<bool> {
+        match (packed_name, shard) {
+            ("qkv_proj.weight", PackedShard::Q) => self.q_proj.set_weight(tensor.clone())?,
+            ("qkv_proj.weight", PackedShard::K) => self.k_proj.set_weight(tensor.clone())?,
+            ("qkv_proj.weight", PackedShard::V) => self.v_proj.set_weight(tensor.clone())?,
+            ("qkv_proj.bias", PackedShard::Q) => self.q_proj.set_bias(tensor.clone())?,
+            ("qkv_proj.bias", PackedShard::K) => self.k_proj.set_bias(tensor.clone())?,
+            ("qkv_proj.bias", PackedShard::V) => self.v_proj.set_bias(tensor.clone())?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     fn forward(
         &self,
         positions: &Tensor,
@@ -304,6 +360,37 @@ impl Qwen3Mlp {
         let gated = gate.broadcast_mul(&sigmoid(&gate)?)?;
         Ok(self.down_proj.forward(&gated.broadcast_mul(&up)?)?)
     }
+
+    fn load_weight(&mut self, name: &str, tensor: &Tensor) -> Result<bool> {
+        match name {
+            "gate_proj.weight" => self.gate_proj.set_weight(tensor.clone())?,
+            "gate_proj.bias" => self.gate_proj.set_bias(tensor.clone())?,
+            "up_proj.weight" => self.up_proj.set_weight(tensor.clone())?,
+            "up_proj.bias" => self.up_proj.set_bias(tensor.clone())?,
+            "down_proj.weight" => self.down_proj.set_weight(tensor.clone())?,
+            "down_proj.bias" => self.down_proj.set_bias(tensor.clone())?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn load_gate_up_packed_shard(
+        &mut self,
+        packed_name: &str,
+        shard: PackedShard,
+        tensor: &Tensor,
+    ) -> Result<bool> {
+        match (packed_name, shard) {
+            ("gate_up_proj.weight", PackedShard::Gate) => {
+                self.gate_proj.set_weight(tensor.clone())?
+            }
+            ("gate_up_proj.weight", PackedShard::Up) => self.up_proj.set_weight(tensor.clone())?,
+            ("gate_up_proj.bias", PackedShard::Gate) => self.gate_proj.set_bias(tensor.clone())?,
+            ("gate_up_proj.bias", PackedShard::Up) => self.up_proj.set_bias(tensor.clone())?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +441,38 @@ impl Qwen3DecoderLayer {
             .forward_with_residual(&attn_out, &input_residual)?;
         let mlp_out = self.mlp.forward(&post_norm)?;
         Ok((mlp_out, post_residual))
+    }
+
+    fn load_weight(&mut self, name: &str, tensor: &Tensor) -> Result<bool> {
+        if let Some(suffix) = name.strip_prefix("self_attn.") {
+            return self.self_attn.load_weight(suffix, tensor);
+        }
+        if let Some(suffix) = name.strip_prefix("mlp.") {
+            return self.mlp.load_weight(suffix, tensor);
+        }
+        match name {
+            "input_layernorm.weight" => self.input_layernorm.set_weight(tensor.clone())?,
+            "post_attention_layernorm.weight" => {
+                self.post_attention_layernorm.set_weight(tensor.clone())?
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn load_packed_shard(
+        &mut self,
+        name: &str,
+        shard: PackedShard,
+        tensor: &Tensor,
+    ) -> Result<bool> {
+        if let Some(suffix) = name.strip_prefix("self_attn.") {
+            return self.self_attn.load_qkv_packed_shard(suffix, shard, tensor);
+        }
+        if let Some(suffix) = name.strip_prefix("mlp.") {
+            return self.mlp.load_gate_up_packed_shard(suffix, shard, tensor);
+        }
+        Ok(false)
     }
 }
 
@@ -452,6 +571,55 @@ impl Qwen3ForCausalLM {
             .iter()
             .copied()
             .find(|mapping| weight_name.contains(mapping.source_fragment))
+    }
+
+    pub fn load_weight(&mut self, name: &str, tensor: &Tensor) -> Result<bool> {
+        match name {
+            "model.embed_tokens.weight" | "embed_tokens.weight" => {
+                self.model.embed_tokens.set_weight(tensor.clone())?;
+                if self.config.tie_word_embeddings {
+                    self.lm_head
+                        .set_weight(self.model.embed_tokens.weight().clone())?;
+                }
+                return Ok(true);
+            }
+            "model.norm.weight" | "norm.weight" => {
+                self.model.norm.set_weight(tensor.clone())?;
+                return Ok(true);
+            }
+            "lm_head.weight" | "model.lm_head.weight" => {
+                self.lm_head.set_weight(tensor.clone())?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        if let Some((layer_idx, layer_tail)) = parse_layer_path(name) {
+            ensure!(
+                layer_idx < self.model.layers.len(),
+                "layer index out of range in weight name: {}",
+                name
+            );
+            return self.model.layers[layer_idx].load_weight(layer_tail, tensor);
+        }
+        Ok(false)
+    }
+
+    pub fn load_packed_shard(
+        &mut self,
+        packed_name: &str,
+        shard: PackedShard,
+        tensor: &Tensor,
+    ) -> Result<bool> {
+        if let Some((layer_idx, layer_tail)) = parse_layer_path(packed_name) {
+            ensure!(
+                layer_idx < self.model.layers.len(),
+                "layer index out of range in packed weight name: {}",
+                packed_name
+            );
+            return self.model.layers[layer_idx].load_packed_shard(layer_tail, shard, tensor);
+        }
+        Ok(false)
     }
 
     pub fn forward_hidden(
