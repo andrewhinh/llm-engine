@@ -1,0 +1,167 @@
+use std::collections::HashMap;
+
+use anyhow::{Result, ensure};
+use candle_core::{IndexOp, Tensor};
+use candle_nn::ops::softmax_last_dim;
+
+#[derive(Debug, Clone)]
+pub struct KvSlot {
+    pub key: Tensor,
+    pub value: Tensor,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvCache {
+    num_slots: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    slots: HashMap<usize, KvSlot>,
+}
+
+impl KvCache {
+    pub fn new(num_slots: usize, num_kv_heads: usize, head_dim: usize) -> Result<Self> {
+        ensure!(num_slots > 0, "num_slots must be positive");
+        ensure!(num_kv_heads > 0, "num_kv_heads must be positive");
+        ensure!(head_dim > 0, "head_dim must be positive");
+        Ok(Self {
+            num_slots,
+            num_kv_heads,
+            head_dim,
+            slots: HashMap::new(),
+        })
+    }
+
+    pub fn write_from_mapping(
+        &mut self,
+        key: &Tensor,
+        value: &Tensor,
+        slot_mapping: &[i32],
+    ) -> Result<()> {
+        ensure!(key.dims() == value.dims(), "key/value shapes must match");
+        let (tokens, kv_heads, head_dim) = key.dims3()?;
+        ensure!(
+            kv_heads == self.num_kv_heads && head_dim == self.head_dim,
+            "key/value shape must match cache dimensions"
+        );
+        ensure!(
+            slot_mapping.len() == tokens,
+            "slot_mapping must have one entry per token"
+        );
+
+        for (token_idx, &slot) in slot_mapping.iter().enumerate() {
+            if slot < 0 {
+                continue;
+            }
+            let slot = slot as usize;
+            ensure!(slot < self.num_slots, "slot index out of range");
+            self.slots.insert(
+                slot,
+                KvSlot {
+                    key: key.i(token_idx)?.contiguous()?,
+                    value: value.i(token_idx)?.contiguous()?,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, slot: usize) -> Option<&KvSlot> {
+        self.slots.get(&slot)
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Attention {
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+}
+
+impl Attention {
+    pub fn new(num_heads: usize, num_kv_heads: usize, head_dim: usize) -> Result<Self> {
+        ensure!(num_heads > 0, "num_heads must be positive");
+        ensure!(num_kv_heads > 0, "num_kv_heads must be positive");
+        ensure!(head_dim > 0, "head_dim must be positive");
+        ensure!(
+            num_heads.is_multiple_of(num_kv_heads),
+            "num_heads must be divisible by num_kv_heads"
+        );
+        Ok(Self {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale: (head_dim as f64).sqrt(),
+        })
+    }
+
+    pub fn write_kv_cache(
+        &self,
+        key: &Tensor,
+        value: &Tensor,
+        slot_mapping: &[i32],
+        cache: &mut KvCache,
+    ) -> Result<()> {
+        cache.write_from_mapping(key, value, slot_mapping)
+    }
+
+    pub fn forward_prefill(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        causal: bool,
+    ) -> Result<Tensor> {
+        let (q_tokens, q_heads, q_dim) = query.dims3()?;
+        let (kv_tokens, kv_heads, kv_dim) = key.dims3()?;
+        ensure!(key.dims() == value.dims(), "key/value shapes must match");
+        ensure!(q_tokens == kv_tokens, "query and key token dims must match");
+        ensure!(q_heads == self.num_heads, "query head count mismatch");
+        ensure!(q_dim == self.head_dim, "query head_dim mismatch");
+        ensure!(
+            kv_heads == self.num_kv_heads,
+            "key/value head count mismatch"
+        );
+        ensure!(kv_dim == self.head_dim, "key/value head_dim mismatch");
+        ensure!(
+            self.num_heads == self.num_kv_heads,
+            "grouped-query attention is not enabled yet"
+        );
+
+        let q = query.transpose(0, 1)?.contiguous()?;
+        let k = key.transpose(0, 1)?.contiguous()?;
+        let v = value.transpose(0, 1)?.contiguous()?;
+
+        let mut scores = q
+            .matmul(&k.transpose(1, 2)?)?
+            .affine(1.0 / self.scale, 0.0)?;
+        if causal {
+            scores = apply_causal_mask(scores)?;
+        }
+        let probs = softmax_last_dim(&scores)?;
+        Ok(probs.matmul(&v)?.transpose(0, 1)?.contiguous()?)
+    }
+}
+
+fn apply_causal_mask(scores: Tensor) -> Result<Tensor> {
+    let (heads, q_tokens, k_tokens) = scores.dims3()?;
+    let mut mask = vec![f32::NEG_INFINITY; q_tokens * k_tokens];
+    for q in 0..q_tokens {
+        for k in 0..k_tokens {
+            if k <= q {
+                mask[q * k_tokens + k] = 0.0;
+            }
+        }
+    }
+    let bias = Tensor::from_vec(mask, (1, q_tokens, k_tokens), scores.device())?
+        .broadcast_as((heads, q_tokens, k_tokens))?;
+    Ok(scores.broadcast_add(&bias)?)
+}
