@@ -30,4 +30,8 @@ impl LLM {
     ) -> Result<EngineStream<'a>> {
         self.engine.generate_stream(prompts, sampling_params)
     }
+
+    pub fn count_prompt_tokens(&self, prompt: &str) -> Result<usize> {
+        Ok(self.engine.encode_prompt(prompt)?.len())
+    }
 }
