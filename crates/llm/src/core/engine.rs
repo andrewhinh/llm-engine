@@ -138,6 +138,8 @@ impl Engine {
             num_kvcache_blocks,
             config.kvcache_block_size,
             comm.clone(),
+            config.max_num_seqs,
+            config.enforce_eager,
         )?;
 
         Ok(Self {

@@ -4,6 +4,7 @@ use candle_core::Tensor;
 use crate::core::Sequence;
 use crate::models::{Comm, KvCache, Qwen3ForCausalLM, RuntimeContext, reset_context, set_context};
 use crate::runner::Sampler;
+use crate::utils::{DecodeExecutionPlan, DecodeGraphRuntime};
 
 #[derive(Debug)]
 pub struct ModelRunner {
@@ -12,6 +13,7 @@ pub struct ModelRunner {
     kv_cache: KvCache,
     block_size: usize,
     comm: Comm,
+    graph_runtime: DecodeGraphRuntime,
 }
 
 #[derive(Debug)]
@@ -28,6 +30,8 @@ impl ModelRunner {
         num_kvcache_blocks: usize,
         block_size: usize,
         comm: Comm,
+        max_num_seqs: usize,
+        enforce_eager: bool,
     ) -> Result<Self> {
         ensure!(
             num_kvcache_blocks > 0,
@@ -39,12 +43,14 @@ impl ModelRunner {
             .ok_or_else(|| anyhow!("num_kvcache_blocks * block_size overflow"))?;
         let cfg = model.config();
         let kv_cache = KvCache::new(num_slots, model.local_num_kv_heads(), cfg.head_dim)?;
+        let graph_runtime = DecodeGraphRuntime::new(max_num_seqs, enforce_eager, false);
         Ok(Self {
             model,
             sampler,
             kv_cache,
             block_size,
             comm,
+            graph_runtime,
         })
     }
 
@@ -55,12 +61,9 @@ impl ModelRunner {
             } else {
                 self.prepare_decode(seqs)?
             };
-            let logits = self.model.forward_logits(
-                &prepared.input_ids,
-                &prepared.positions,
-                prepared.slot_mapping.as_deref(),
-                Some(&mut self.kv_cache),
-            )?;
+            let decode_batch = prepared.input_ids.dims1()?;
+            let exec_plan = self.graph_runtime.plan(is_prefill, decode_batch);
+            let logits = self.run_model_with_plan(&prepared, exec_plan)?;
             self.sample(&logits, seqs)
         })();
         reset_context();
@@ -77,6 +80,31 @@ impl ModelRunner {
 
     pub fn kv_cache_size(&self) -> usize {
         self.kv_cache.len()
+    }
+
+    pub fn graph_runtime(&self) -> &DecodeGraphRuntime {
+        &self.graph_runtime
+    }
+
+    fn run_model_with_plan(
+        &mut self,
+        prepared: &PreparedBatch,
+        exec_plan: DecodeExecutionPlan,
+    ) -> Result<Tensor> {
+        match exec_plan {
+            DecodeExecutionPlan::Eager => self.model.forward_logits(
+                &prepared.input_ids,
+                &prepared.positions,
+                prepared.slot_mapping.as_deref(),
+                Some(&mut self.kv_cache),
+            ),
+            DecodeExecutionPlan::GraphReplay { .. } => self.model.forward_logits(
+                &prepared.input_ids,
+                &prepared.positions,
+                prepared.slot_mapping.as_deref(),
+                Some(&mut self.kv_cache),
+            ),
+        }
     }
 
     fn prepare_prefill(&self, seqs: &[&Sequence]) -> Result<PreparedBatch> {
