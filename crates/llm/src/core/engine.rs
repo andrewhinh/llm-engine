@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::core::prefix_cache_hash::PrefixCacheConfig;
 use crate::core::{ModelRunner, Scheduler, Sequence};
-use crate::models::Qwen3ForCausalLM;
+use crate::models::{Comm, Qwen3ForCausalLM};
 use crate::runner::Sampler;
 use crate::utils::config::{EngineConfig, SamplingParams};
 use crate::utils::kvcache_allocator::{KVCacheAllocator, KVCachePlan};
@@ -78,6 +78,7 @@ pub struct Engine {
     pub kv_cache_plan: KVCachePlan,
     pub scheduler: Scheduler,
     pub runner: ModelRunner,
+    pub comm: Comm,
     active_requests: HashSet<usize>,
     pending_cancellations: VecDeque<usize>,
 }
@@ -91,6 +92,7 @@ pub struct EngineStream<'a> {
 impl Engine {
     pub fn new(mut config: EngineConfig) -> Result<Self> {
         config.validate()?;
+        let comm = Comm::bootstrap(config.tensor_parallel_size)?;
 
         let model_dir = PathBuf::from(&config.model);
         ensure!(
@@ -126,7 +128,8 @@ impl Engine {
 
         let device = Device::Cpu;
         let dtype = DType::F32;
-        let mut model = Qwen3ForCausalLM::from_model_config(&model_config, dtype, &device)?;
+        let mut model =
+            Qwen3ForCausalLM::from_model_config(&model_config, dtype, &device, comm.clone())?;
         load_qwen3_weights_from_model_path(&mut model, &config.model, &device)?;
         let sampler = Sampler::from_seed(0);
         let runner = ModelRunner::new(
@@ -134,6 +137,7 @@ impl Engine {
             sampler,
             num_kvcache_blocks,
             config.kvcache_block_size,
+            comm.clone(),
         )?;
 
         Ok(Self {
@@ -143,6 +147,7 @@ impl Engine {
             kv_cache_plan,
             scheduler,
             runner,
+            comm,
             active_requests: HashSet::new(),
             pending_cancellations: VecDeque::new(),
         })

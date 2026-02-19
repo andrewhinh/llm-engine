@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, ensure};
 use candle_core::Tensor;
 
 use crate::core::Sequence;
-use crate::models::{KvCache, Qwen3ForCausalLM, RuntimeContext, reset_context, set_context};
+use crate::models::{Comm, KvCache, Qwen3ForCausalLM, RuntimeContext, reset_context, set_context};
 use crate::runner::Sampler;
 
 #[derive(Debug)]
@@ -11,6 +11,7 @@ pub struct ModelRunner {
     sampler: Sampler,
     kv_cache: KvCache,
     block_size: usize,
+    comm: Comm,
 }
 
 #[derive(Debug)]
@@ -26,6 +27,7 @@ impl ModelRunner {
         sampler: Sampler,
         num_kvcache_blocks: usize,
         block_size: usize,
+        comm: Comm,
     ) -> Result<Self> {
         ensure!(
             num_kvcache_blocks > 0,
@@ -36,12 +38,13 @@ impl ModelRunner {
             .checked_mul(block_size)
             .ok_or_else(|| anyhow!("num_kvcache_blocks * block_size overflow"))?;
         let cfg = model.config();
-        let kv_cache = KvCache::new(num_slots, cfg.num_key_value_heads, cfg.head_dim)?;
+        let kv_cache = KvCache::new(num_slots, model.local_num_kv_heads(), cfg.head_dim)?;
         Ok(Self {
             model,
             sampler,
             kv_cache,
             block_size,
+            comm,
         })
     }
 
@@ -66,6 +69,10 @@ impl ModelRunner {
 
     pub fn model(&self) -> &Qwen3ForCausalLM {
         &self.model
+    }
+
+    pub fn comm(&self) -> &Comm {
+        &self.comm
     }
 
     pub fn kv_cache_size(&self) -> usize {

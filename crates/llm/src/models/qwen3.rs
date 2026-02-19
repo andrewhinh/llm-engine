@@ -3,7 +3,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 
 use crate::models::layers::{
-    Attention, KvCache, Linear, LmHead, RmsNorm, RotaryEmbedding, VocabEmbedding, get_context,
+    Attention, Comm, KvCache, LmHead, RmsNorm, RotaryEmbedding, TensorParallelColumnLinear,
+    TensorParallelRowLinear, VocabEmbedding, get_context, kv_head_shard, shard_size,
 };
 use crate::utils::tokenizer::ModelConfig;
 
@@ -142,10 +143,10 @@ impl Qwen3Config {
 
 #[derive(Debug, Clone)]
 struct Qwen3Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: TensorParallelColumnLinear,
+    k_proj: TensorParallelColumnLinear,
+    v_proj: TensorParallelColumnLinear,
+    o_proj: TensorParallelRowLinear,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     rotary: RotaryEmbedding,
@@ -156,32 +157,43 @@ struct Qwen3Attention {
 }
 
 impl Qwen3Attention {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
-        let q_out = config.num_attention_heads * config.head_dim;
-        let kv_out = config.num_key_value_heads * config.head_dim;
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
+        let local_num_heads = shard_size(config.num_attention_heads, comm.world_size())?;
+        let local_num_kv_heads =
+            kv_head_shard(config.num_key_value_heads, comm.rank(), comm.world_size())?;
 
-        let q_proj = Linear::zeros(
+        let q_proj = TensorParallelColumnLinear::zeros(
             config.hidden_size,
-            q_out,
+            config.num_attention_heads * config.head_dim,
             config.attention_bias,
             dtype,
             device,
+            comm.clone(),
         )?;
-        let k_proj = Linear::zeros(
+        let k_proj = TensorParallelColumnLinear::zeros(
             config.hidden_size,
-            kv_out,
+            config.num_key_value_heads * config.head_dim,
             config.attention_bias,
             dtype,
             device,
+            comm.clone(),
         )?;
-        let v_proj = Linear::zeros(
+        let v_proj = TensorParallelColumnLinear::zeros(
             config.hidden_size,
-            kv_out,
+            config.num_key_value_heads * config.head_dim,
             config.attention_bias,
             dtype,
             device,
+            comm.clone(),
         )?;
-        let o_proj = Linear::zeros(config.hidden_size, config.hidden_size, false, dtype, device)?;
+        let o_proj = TensorParallelRowLinear::zeros(
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            false,
+            dtype,
+            device,
+            comm.clone(),
+        )?;
 
         let q_norm = if config.attention_bias {
             None
@@ -210,11 +222,7 @@ impl Qwen3Attention {
             config.rope_theta,
             device,
         )?;
-        let attn = Attention::new(
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-        )?;
+        let attn = Attention::new(local_num_heads, local_num_kv_heads, config.head_dim)?;
 
         Ok(Self {
             q_proj,
@@ -225,22 +233,22 @@ impl Qwen3Attention {
             k_norm,
             rotary,
             attn,
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
+            num_heads: local_num_heads,
+            num_kv_heads: local_num_kv_heads,
             head_dim: config.head_dim,
         })
     }
 
     fn load_weight(&mut self, name: &str, tensor: &Tensor) -> Result<bool> {
         match name {
-            "q_proj.weight" => self.q_proj.set_weight(tensor.clone())?,
-            "q_proj.bias" => self.q_proj.set_bias(tensor.clone())?,
-            "k_proj.weight" => self.k_proj.set_weight(tensor.clone())?,
-            "k_proj.bias" => self.k_proj.set_bias(tensor.clone())?,
-            "v_proj.weight" => self.v_proj.set_weight(tensor.clone())?,
-            "v_proj.bias" => self.v_proj.set_bias(tensor.clone())?,
-            "o_proj.weight" => self.o_proj.set_weight(tensor.clone())?,
-            "o_proj.bias" => self.o_proj.set_bias(tensor.clone())?,
+            "q_proj.weight" => self.q_proj.set_weight_from_full(tensor.clone())?,
+            "q_proj.bias" => self.q_proj.set_bias_from_full(tensor.clone())?,
+            "k_proj.weight" => self.k_proj.set_weight_from_full(tensor.clone())?,
+            "k_proj.bias" => self.k_proj.set_bias_from_full(tensor.clone())?,
+            "v_proj.weight" => self.v_proj.set_weight_from_full(tensor.clone())?,
+            "v_proj.bias" => self.v_proj.set_bias_from_full(tensor.clone())?,
+            "o_proj.weight" => self.o_proj.set_weight_from_full(tensor.clone())?,
+            "o_proj.bias" => self.o_proj.set_bias_from_full(tensor.clone())?,
             "q_norm.weight" => {
                 if let Some(norm) = &mut self.q_norm {
                     norm.set_weight(tensor.clone())?;
@@ -267,12 +275,18 @@ impl Qwen3Attention {
         tensor: &Tensor,
     ) -> Result<bool> {
         match (packed_name, shard) {
-            ("qkv_proj.weight", PackedShard::Q) => self.q_proj.set_weight(tensor.clone())?,
-            ("qkv_proj.weight", PackedShard::K) => self.k_proj.set_weight(tensor.clone())?,
-            ("qkv_proj.weight", PackedShard::V) => self.v_proj.set_weight(tensor.clone())?,
-            ("qkv_proj.bias", PackedShard::Q) => self.q_proj.set_bias(tensor.clone())?,
-            ("qkv_proj.bias", PackedShard::K) => self.k_proj.set_bias(tensor.clone())?,
-            ("qkv_proj.bias", PackedShard::V) => self.v_proj.set_bias(tensor.clone())?,
+            ("qkv_proj.weight", PackedShard::Q) => {
+                self.q_proj.set_weight_from_full(tensor.clone())?
+            }
+            ("qkv_proj.weight", PackedShard::K) => {
+                self.k_proj.set_weight_from_full(tensor.clone())?
+            }
+            ("qkv_proj.weight", PackedShard::V) => {
+                self.v_proj.set_weight_from_full(tensor.clone())?
+            }
+            ("qkv_proj.bias", PackedShard::Q) => self.q_proj.set_bias_from_full(tensor.clone())?,
+            ("qkv_proj.bias", PackedShard::K) => self.k_proj.set_bias_from_full(tensor.clone())?,
+            ("qkv_proj.bias", PackedShard::V) => self.v_proj.set_bias_from_full(tensor.clone())?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -353,34 +367,37 @@ impl Qwen3Attention {
 
 #[derive(Debug, Clone)]
 struct Qwen3Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: TensorParallelColumnLinear,
+    up_proj: TensorParallelColumnLinear,
+    down_proj: TensorParallelRowLinear,
 }
 
 impl Qwen3Mlp {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
         Ok(Self {
-            gate_proj: Linear::zeros(
+            gate_proj: TensorParallelColumnLinear::zeros(
                 config.hidden_size,
                 config.intermediate_size,
                 false,
                 dtype,
                 device,
+                comm.clone(),
             )?,
-            up_proj: Linear::zeros(
+            up_proj: TensorParallelColumnLinear::zeros(
                 config.hidden_size,
                 config.intermediate_size,
                 false,
                 dtype,
                 device,
+                comm.clone(),
             )?,
-            down_proj: Linear::zeros(
+            down_proj: TensorParallelRowLinear::zeros(
                 config.intermediate_size,
                 config.hidden_size,
                 false,
                 dtype,
                 device,
+                comm.clone(),
             )?,
         })
     }
@@ -394,12 +411,12 @@ impl Qwen3Mlp {
 
     fn load_weight(&mut self, name: &str, tensor: &Tensor) -> Result<bool> {
         match name {
-            "gate_proj.weight" => self.gate_proj.set_weight(tensor.clone())?,
-            "gate_proj.bias" => self.gate_proj.set_bias(tensor.clone())?,
-            "up_proj.weight" => self.up_proj.set_weight(tensor.clone())?,
-            "up_proj.bias" => self.up_proj.set_bias(tensor.clone())?,
-            "down_proj.weight" => self.down_proj.set_weight(tensor.clone())?,
-            "down_proj.bias" => self.down_proj.set_bias(tensor.clone())?,
+            "gate_proj.weight" => self.gate_proj.set_weight_from_full(tensor.clone())?,
+            "gate_proj.bias" => self.gate_proj.set_bias_from_full(tensor.clone())?,
+            "up_proj.weight" => self.up_proj.set_weight_from_full(tensor.clone())?,
+            "up_proj.bias" => self.up_proj.set_bias_from_full(tensor.clone())?,
+            "down_proj.weight" => self.down_proj.set_weight_from_full(tensor.clone())?,
+            "down_proj.bias" => self.down_proj.set_bias_from_full(tensor.clone())?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -413,11 +430,17 @@ impl Qwen3Mlp {
     ) -> Result<bool> {
         match (packed_name, shard) {
             ("gate_up_proj.weight", PackedShard::Gate) => {
-                self.gate_proj.set_weight(tensor.clone())?
+                self.gate_proj.set_weight_from_full(tensor.clone())?
             }
-            ("gate_up_proj.weight", PackedShard::Up) => self.up_proj.set_weight(tensor.clone())?,
-            ("gate_up_proj.bias", PackedShard::Gate) => self.gate_proj.set_bias(tensor.clone())?,
-            ("gate_up_proj.bias", PackedShard::Up) => self.up_proj.set_bias(tensor.clone())?,
+            ("gate_up_proj.weight", PackedShard::Up) => {
+                self.up_proj.set_weight_from_full(tensor.clone())?
+            }
+            ("gate_up_proj.bias", PackedShard::Gate) => {
+                self.gate_proj.set_bias_from_full(tensor.clone())?
+            }
+            ("gate_up_proj.bias", PackedShard::Up) => {
+                self.up_proj.set_bias_from_full(tensor.clone())?
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -433,10 +456,10 @@ struct Qwen3DecoderLayer {
 }
 
 impl Qwen3DecoderLayer {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
         Ok(Self {
-            self_attn: Qwen3Attention::zeros(config, dtype, device)?,
-            mlp: Qwen3Mlp::zeros(config, dtype, device)?,
+            self_attn: Qwen3Attention::zeros(config, dtype, device, comm)?,
+            mlp: Qwen3Mlp::zeros(config, dtype, device, comm)?,
             input_layernorm: RmsNorm::ones(config.hidden_size, config.rms_norm_eps, dtype, device)?,
             post_attention_layernorm: RmsNorm::ones(
                 config.hidden_size,
@@ -515,10 +538,10 @@ struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
+    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for _ in 0..config.num_hidden_layers {
-            layers.push(Qwen3DecoderLayer::zeros(config, dtype, device)?);
+            layers.push(Qwen3DecoderLayer::zeros(config, dtype, device, comm)?);
         }
         Ok(Self {
             embed_tokens: VocabEmbedding::zeros(
@@ -567,11 +590,15 @@ pub struct Qwen3ForCausalLM {
     config: Qwen3Config,
     model: Qwen3Model,
     lm_head: LmHead,
+    comm: Comm,
+    local_num_kv_heads: usize,
 }
 
 impl Qwen3ForCausalLM {
-    pub fn zeros(config: Qwen3Config, dtype: DType, device: &Device) -> Result<Self> {
-        let model = Qwen3Model::zeros(&config, dtype, device)?;
+    pub fn zeros(config: Qwen3Config, dtype: DType, device: &Device, comm: Comm) -> Result<Self> {
+        let local_num_kv_heads =
+            kv_head_shard(config.num_key_value_heads, comm.rank(), comm.world_size())?;
+        let model = Qwen3Model::zeros(&config, dtype, device, &comm)?;
         let lm_head = if config.tie_word_embeddings {
             LmHead::new(model.embed_tokens.weight().clone())
         } else {
@@ -581,6 +608,8 @@ impl Qwen3ForCausalLM {
             config,
             model,
             lm_head,
+            comm,
+            local_num_kv_heads,
         })
     }
 
@@ -588,9 +617,10 @@ impl Qwen3ForCausalLM {
         model_config: &ModelConfig,
         dtype: DType,
         device: &Device,
+        comm: Comm,
     ) -> Result<Self> {
         let config = Qwen3Config::from_model_config(model_config)?;
-        Self::zeros(config, dtype, device)
+        Self::zeros(config, dtype, device, comm)
     }
 
     pub fn packed_modules_mapping() -> &'static [PackedModuleMapping] {
@@ -691,5 +721,17 @@ impl Qwen3ForCausalLM {
 
     pub fn device(&self) -> &Device {
         self.model.embed_tokens.weight().device()
+    }
+
+    pub fn tp_rank(&self) -> usize {
+        self.comm.rank()
+    }
+
+    pub fn tp_world_size(&self) -> usize {
+        self.comm.world_size()
+    }
+
+    pub fn local_num_kv_heads(&self) -> usize {
+        self.local_num_kv_heads
     }
 }

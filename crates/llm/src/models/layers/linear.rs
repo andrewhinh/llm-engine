@@ -1,5 +1,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 
+use super::distributed::{Comm, shard_range, shard_size};
+
 #[derive(Debug, Clone)]
 pub struct Linear {
     weight: Tensor,
@@ -78,5 +80,114 @@ impl Linear {
             Some(bias) => y.broadcast_add(bias),
             None => Ok(y),
         }
+    }
+}
+
+fn shard_tensor_dim(full: &Tensor, dim: usize, comm: &Comm) -> Result<Tensor> {
+    if comm.world_size() == 1 {
+        return Ok(full.clone());
+    }
+    let total = full.dim(dim)?;
+    let range = shard_range(total, comm.rank(), comm.world_size())
+        .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    let len = range.end - range.start;
+    full.narrow(dim, range.start, len)
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorParallelColumnLinear {
+    linear: Linear,
+    comm: Comm,
+}
+
+impl TensorParallelColumnLinear {
+    pub fn zeros(
+        input_size: usize,
+        output_size: usize,
+        bias: bool,
+        dtype: DType,
+        device: &Device,
+        comm: Comm,
+    ) -> Result<Self> {
+        let local_output = shard_size(output_size, comm.world_size())
+            .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+        let linear = Linear::zeros(input_size, local_output, bias, dtype, device)?;
+        Ok(Self { linear, comm })
+    }
+
+    pub fn set_weight_from_full(&mut self, full_weight: Tensor) -> Result<()> {
+        let sharded = shard_tensor_dim(&full_weight, 0, &self.comm)?;
+        self.linear.set_weight(sharded)
+    }
+
+    pub fn set_bias_from_full(&mut self, full_bias: Tensor) -> Result<()> {
+        let sharded = shard_tensor_dim(&full_bias, 0, &self.comm)?;
+        self.linear.set_bias(sharded)
+    }
+
+    pub fn set_weight(&mut self, weight: Tensor) -> Result<()> {
+        self.linear.set_weight(weight)
+    }
+
+    pub fn set_bias(&mut self, bias: Tensor) -> Result<()> {
+        self.linear.set_bias(bias)
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.linear.forward(x)
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        self.linear.weight()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorParallelRowLinear {
+    linear: Linear,
+    comm: Comm,
+}
+
+impl TensorParallelRowLinear {
+    pub fn zeros(
+        input_size: usize,
+        output_size: usize,
+        bias: bool,
+        dtype: DType,
+        device: &Device,
+        comm: Comm,
+    ) -> Result<Self> {
+        let local_input = shard_size(input_size, comm.world_size())
+            .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+        let linear = Linear::zeros(local_input, output_size, bias, dtype, device)?;
+        Ok(Self { linear, comm })
+    }
+
+    pub fn set_weight_from_full(&mut self, full_weight: Tensor) -> Result<()> {
+        let sharded = shard_tensor_dim(&full_weight, 1, &self.comm)?;
+        self.linear.set_weight(sharded)
+    }
+
+    pub fn set_bias_from_full(&mut self, full_bias: Tensor) -> Result<()> {
+        self.linear.set_bias(full_bias)
+    }
+
+    pub fn set_weight(&mut self, weight: Tensor) -> Result<()> {
+        self.linear.set_weight(weight)
+    }
+
+    pub fn set_bias(&mut self, bias: Tensor) -> Result<()> {
+        self.linear.set_bias(bias)
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let y = self.linear.forward(x)?;
+        self.comm
+            .all_reduce_sum(&y)
+            .map_err(|e| candle_core::Error::msg(e.to_string()))
+    }
+
+    pub fn weight(&self) -> &Tensor {
+        self.linear.weight()
     }
 }
