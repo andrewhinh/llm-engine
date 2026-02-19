@@ -1,5 +1,6 @@
 pub mod api;
 pub mod core;
+pub mod ipc;
 pub mod models;
 pub mod runner;
 pub mod server;
