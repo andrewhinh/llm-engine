@@ -1,13 +1,48 @@
-use anyhow::{Result, ensure};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use tokenizers::Tokenizer;
+use std::time::Instant;
 
-use crate::utils::config::EngineConfig;
+use anyhow::{Result, anyhow, ensure};
+use candle_core::{DType, Device};
+use tokenizers::Tokenizer;
+use tracing::info;
+
+use crate::core::prefix_cache_hash::PrefixCacheConfig;
+use crate::core::{ModelRunner, Scheduler, Sequence};
+use crate::models::Qwen3ForCausalLM;
+use crate::runner::Sampler;
+use crate::utils::config::{EngineConfig, SamplingParams};
 use crate::utils::kvcache_allocator::{KVCacheAllocator, KVCachePlan};
+use crate::utils::loader::load_qwen3_weights_from_model_path;
 use crate::utils::tokenizer::{
     ModelConfig, decode_tokens, encode_prompt, load_model_config, load_tokenizer,
     load_tokenizer_config, resolve_eos_id,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationOutput {
+    pub seq_id: usize,
+    pub text: String,
+    pub token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedOutput {
+    pub seq_id: usize,
+    pub token_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOutput {
+    pub finished: Vec<FinishedOutput>,
+    pub num_tokens: isize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptInput<'a> {
+    Text(&'a str),
+    TokenIds(&'a [u32]),
+}
 
 #[derive(Debug)]
 pub struct Engine {
@@ -15,6 +50,8 @@ pub struct Engine {
     pub model_config: ModelConfig,
     pub tokenizer: Tokenizer,
     pub kv_cache_plan: KVCachePlan,
+    pub scheduler: Scheduler,
+    pub runner: ModelRunner,
 }
 
 impl Engine {
@@ -48,11 +85,30 @@ impl Engine {
         let tokenizer_config = load_tokenizer_config(&model_dir)?;
         config.eos = resolve_eos_id(&tokenizer, tokenizer_config.as_ref(), config.eos)?;
 
+        let num_kvcache_blocks = usize::try_from(config.num_kvcache_blocks)
+            .map_err(|_| anyhow!("num_kvcache_blocks must be positive after kv planning"))?;
+        let prefix_cfg = PrefixCacheConfig::default();
+        let scheduler = Scheduler::new(&config, prefix_cfg)?;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let mut model = Qwen3ForCausalLM::from_model_config(&model_config, dtype, &device)?;
+        load_qwen3_weights_from_model_path(&mut model, &config.model, &device)?;
+        let sampler = Sampler::from_seed(0);
+        let runner = ModelRunner::new(
+            model,
+            sampler,
+            num_kvcache_blocks,
+            config.kvcache_block_size,
+        )?;
+
         Ok(Self {
             config,
             model_config,
             tokenizer,
             kv_cache_plan,
+            scheduler,
+            runner,
         })
     }
 
@@ -63,4 +119,152 @@ impl Engine {
     pub fn decode_tokens(&self, token_ids: &[u32]) -> Result<String> {
         decode_tokens(&self.tokenizer, token_ids)
     }
+
+    pub fn add_request(
+        &mut self,
+        prompt: PromptInput<'_>,
+        sampling_params: SamplingParams,
+    ) -> Result<usize> {
+        sampling_params.validate()?;
+        let token_ids = match prompt {
+            PromptInput::Text(prompt) => self.encode_prompt(prompt)?,
+            PromptInput::TokenIds(token_ids) => token_ids.to_vec(),
+        };
+        ensure!(
+            !token_ids.is_empty(),
+            "prompt must contain at least one token"
+        );
+        let seq = Sequence::new(token_ids, self.config.kvcache_block_size, sampling_params);
+        Ok(self.scheduler.add(seq))
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.scheduler.is_finished()
+    }
+
+    pub fn step(&mut self) -> Result<StepOutput> {
+        let (scheduled_ids, is_prefill) = self.scheduler.schedule()?;
+        let (seq_snapshots, output_ids, num_tokens) = {
+            let seqs = self.scheduler.get_running_sequences(&scheduled_ids)?;
+            let output_ids = self.runner.run(&seqs, is_prefill)?;
+            ensure!(
+                output_ids.len() == seqs.len(),
+                "runner output size mismatch"
+            );
+            let num_tokens = if is_prefill {
+                seqs.iter().map(|seq| seq.len()).sum::<usize>() as isize
+            } else {
+                -(seqs.len() as isize)
+            };
+            let seq_snapshots = seqs.iter().map(|seq| (*seq).clone()).collect::<Vec<_>>();
+            (seq_snapshots, output_ids, num_tokens)
+        };
+
+        let eos = u32::try_from(self.config.eos)
+            .map_err(|_| anyhow!("engine eos must be non-negative during stepping"))?;
+        let finished = seq_snapshots
+            .iter()
+            .zip(output_ids.iter())
+            .filter_map(|(seq, token_id)| {
+                if is_sequence_finished(seq, *token_id, eos) {
+                    let mut token_ids = seq.completion_token_ids().to_vec();
+                    token_ids.push(*token_id);
+                    Some(FinishedOutput {
+                        seq_id: seq.id,
+                        token_ids,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.scheduler.postprocess(&scheduled_ids, &output_ids)?;
+        Ok(StepOutput {
+            finished,
+            num_tokens,
+        })
+    }
+
+    pub fn generate_sync(
+        &mut self,
+        prompts: &[String],
+        sampling_params: &[SamplingParams],
+    ) -> Result<Vec<GenerationOutput>> {
+        ensure!(!prompts.is_empty(), "prompts must not be empty");
+        let params = expand_sampling_params(prompts.len(), sampling_params)?;
+
+        let mut submission_order = Vec::with_capacity(prompts.len());
+        for (prompt, params) in prompts.iter().zip(params.into_iter()) {
+            let seq_id = self.add_request(PromptInput::Text(prompt), params)?;
+            submission_order.push(seq_id);
+        }
+
+        let mut finished_by_seq = HashMap::with_capacity(submission_order.len());
+        let mut prefill_throughput = 0.0f32;
+        let mut decode_throughput = 0.0f32;
+
+        while !self.is_finished() {
+            let start = Instant::now();
+            let StepOutput {
+                finished,
+                num_tokens,
+            } = self.step()?;
+            let elapsed = start.elapsed().as_secs_f32().max(f32::EPSILON);
+            if num_tokens > 0 {
+                prefill_throughput = num_tokens as f32 / elapsed;
+            } else if num_tokens < 0 {
+                decode_throughput = (-num_tokens) as f32 / elapsed;
+            }
+            info!(
+                prefill_tok_s = prefill_throughput,
+                decode_tok_s = decode_throughput,
+                "engine step throughput"
+            );
+            for output in finished {
+                finished_by_seq.insert(output.seq_id, output.token_ids);
+            }
+        }
+
+        submission_order
+            .into_iter()
+            .map(|seq_id| {
+                let token_ids = finished_by_seq
+                    .remove(&seq_id)
+                    .ok_or_else(|| anyhow!("missing output for sequence {}", seq_id))?;
+                let text = self.decode_tokens(&token_ids)?;
+                Ok(GenerationOutput {
+                    seq_id,
+                    text,
+                    token_ids,
+                })
+            })
+            .collect()
+    }
+}
+
+fn is_sequence_finished(seq: &Sequence, next_token: u32, eos_token_id: u32) -> bool {
+    let reached_eos = !seq.sampling_params.ignore_eos && next_token == eos_token_id;
+    let reached_max = seq.num_completion_tokens() + 1 == seq.sampling_params.max_tokens;
+    reached_eos || reached_max
+}
+
+fn expand_sampling_params(
+    prompts_len: usize,
+    sampling_params: &[SamplingParams],
+) -> Result<Vec<SamplingParams>> {
+    ensure!(
+        !sampling_params.is_empty(),
+        "sampling_params must not be empty"
+    );
+    if sampling_params.len() == 1 {
+        return Ok(vec![sampling_params[0].clone(); prompts_len]);
+    }
+    ensure!(
+        sampling_params.len() == prompts_len,
+        "sampling_params size {} must be 1 or match prompts size {}",
+        sampling_params.len(),
+        prompts_len
+    );
+    Ok(sampling_params.to_vec())
 }
