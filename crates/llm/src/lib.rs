@@ -9,5 +9,8 @@ pub use api::LLM;
 pub use core::Engine;
 pub use core::ModelRunner;
 pub use core::Scheduler;
-pub use core::{FinishedOutput, GenerationOutput, PromptInput, StepOutput};
+pub use core::{
+    CancelledOutput, EngineStream, FinishedOutput, GenerationOutput, PromptInput, StepOutput,
+    StreamOutput, TokenOutput,
+};
 pub use utils::{EngineConfig, SamplingParams};

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -34,8 +34,34 @@ pub struct FinishedOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepOutput {
+    pub tokens: Vec<TokenOutput>,
     pub finished: Vec<FinishedOutput>,
+    pub cancelled: Vec<CancelledOutput>,
     pub num_tokens: isize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenOutput {
+    pub seq_id: usize,
+    pub token_id: u32,
+    pub finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledOutput {
+    pub seq_id: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamOutput {
+    Token {
+        seq_id: usize,
+        token_id: u32,
+        text: String,
+        finished: bool,
+    },
+    Done(GenerationOutput),
+    Cancelled(CancelledOutput),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +78,14 @@ pub struct Engine {
     pub kv_cache_plan: KVCachePlan,
     pub scheduler: Scheduler,
     pub runner: ModelRunner,
+    active_requests: HashSet<usize>,
+    pending_cancellations: VecDeque<usize>,
+}
+
+pub struct EngineStream<'a> {
+    engine: &'a mut Engine,
+    pending_events: VecDeque<StreamOutput>,
+    done: bool,
 }
 
 impl Engine {
@@ -109,6 +143,8 @@ impl Engine {
             kv_cache_plan,
             scheduler,
             runner,
+            active_requests: HashSet::new(),
+            pending_cancellations: VecDeque::new(),
         })
     }
 
@@ -135,7 +171,9 @@ impl Engine {
             "prompt must contain at least one token"
         );
         let seq = Sequence::new(token_ids, self.config.kvcache_block_size, sampling_params);
-        Ok(self.scheduler.add(seq))
+        let seq_id = self.scheduler.add(seq);
+        self.active_requests.insert(seq_id);
+        Ok(seq_id)
     }
 
     pub fn is_finished(&self) -> bool {
@@ -143,6 +181,16 @@ impl Engine {
     }
 
     pub fn step(&mut self) -> Result<StepOutput> {
+        let cancelled = self.apply_pending_cancellations();
+        if self.scheduler.is_finished() {
+            return Ok(StepOutput {
+                tokens: Vec::new(),
+                finished: Vec::new(),
+                cancelled,
+                num_tokens: 0,
+            });
+        }
+
         let (scheduled_ids, is_prefill) = self.scheduler.schedule()?;
         let (seq_snapshots, output_ids, num_tokens) = {
             let seqs = self.scheduler.get_running_sequences(&scheduled_ids)?;
@@ -162,11 +210,13 @@ impl Engine {
 
         let eos = u32::try_from(self.config.eos)
             .map_err(|_| anyhow!("engine eos must be non-negative during stepping"))?;
+        let mut finished_ids = HashSet::new();
         let finished = seq_snapshots
             .iter()
             .zip(output_ids.iter())
             .filter_map(|(seq, token_id)| {
                 if is_sequence_finished(seq, *token_id, eos) {
+                    finished_ids.insert(seq.id);
                     let mut token_ids = seq.completion_token_ids().to_vec();
                     token_ids.push(*token_id);
                     Some(FinishedOutput {
@@ -178,10 +228,25 @@ impl Engine {
                 }
             })
             .collect::<Vec<_>>();
+        let tokens = seq_snapshots
+            .iter()
+            .zip(output_ids.iter())
+            .map(|(seq, token_id)| TokenOutput {
+                seq_id: seq.id,
+                token_id: *token_id,
+                finished: finished_ids.contains(&seq.id),
+            })
+            .collect::<Vec<_>>();
 
         self.scheduler.postprocess(&scheduled_ids, &output_ids)?;
+        for finished in &finished {
+            self.active_requests.remove(&finished.seq_id);
+        }
+
         Ok(StepOutput {
+            tokens,
             finished,
+            cancelled,
             num_tokens,
         })
     }
@@ -209,6 +274,7 @@ impl Engine {
             let StepOutput {
                 finished,
                 num_tokens,
+                ..
             } = self.step()?;
             let elapsed = start.elapsed().as_secs_f32().max(f32::EPSILON);
             if num_tokens > 0 {
@@ -240,6 +306,131 @@ impl Engine {
                 })
             })
             .collect()
+    }
+
+    pub fn generate_stream<'a>(
+        &'a mut self,
+        prompts: &[String],
+        sampling_params: &[SamplingParams],
+    ) -> Result<EngineStream<'a>> {
+        ensure!(!prompts.is_empty(), "prompts must not be empty");
+        let params = expand_sampling_params(prompts.len(), sampling_params)?;
+        for (prompt, params) in prompts.iter().zip(params.into_iter()) {
+            let _ = self.add_request(PromptInput::Text(prompt), params)?;
+        }
+        Ok(EngineStream {
+            engine: self,
+            pending_events: VecDeque::new(),
+            done: false,
+        })
+    }
+
+    pub fn cancel_request(&mut self, seq_id: usize) -> bool {
+        if !self.active_requests.contains(&seq_id) {
+            return false;
+        }
+        if self.pending_cancellations.iter().any(|id| *id == seq_id) {
+            return true;
+        }
+        self.pending_cancellations.push_back(seq_id);
+        true
+    }
+
+    pub fn cancel_all_requests(&mut self) -> usize {
+        let active_ids = self.active_requests.iter().copied().collect::<Vec<_>>();
+        let mut queued = 0usize;
+        for seq_id in active_ids {
+            if self.pending_cancellations.iter().any(|id| *id == seq_id) {
+                continue;
+            }
+            self.pending_cancellations.push_back(seq_id);
+            queued += 1;
+        }
+        queued
+    }
+
+    fn apply_pending_cancellations(&mut self) -> Vec<CancelledOutput> {
+        let mut cancelled = Vec::new();
+        while let Some(seq_id) = self.pending_cancellations.pop_front() {
+            if self.scheduler.cancel(seq_id) {
+                self.active_requests.remove(&seq_id);
+                cancelled.push(CancelledOutput { seq_id });
+            }
+        }
+        cancelled
+    }
+}
+
+impl<'a> EngineStream<'a> {
+    pub fn cancel_request(&mut self, seq_id: usize) -> bool {
+        self.engine.cancel_request(seq_id)
+    }
+
+    pub fn cancel_all_requests(&mut self) -> usize {
+        self.engine.cancel_all_requests()
+    }
+}
+
+impl<'a> Iterator for EngineStream<'a> {
+    type Item = Result<StreamOutput>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Some(Ok(event));
+            }
+            if self.done {
+                return None;
+            }
+
+            let step = match self.engine.step() {
+                Ok(step) => step,
+                Err(err) => {
+                    self.done = true;
+                    return Some(Err(err));
+                }
+            };
+
+            for cancelled in step.cancelled {
+                self.pending_events
+                    .push_back(StreamOutput::Cancelled(cancelled));
+            }
+            for token in step.tokens {
+                let text = match self.engine.decode_tokens(&[token.token_id]) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        self.done = true;
+                        return Some(Err(err));
+                    }
+                };
+                self.pending_events.push_back(StreamOutput::Token {
+                    seq_id: token.seq_id,
+                    token_id: token.token_id,
+                    text,
+                    finished: token.finished,
+                });
+            }
+            for finished in step.finished {
+                let text = match self.engine.decode_tokens(&finished.token_ids) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        self.done = true;
+                        return Some(Err(err));
+                    }
+                };
+                self.pending_events
+                    .push_back(StreamOutput::Done(GenerationOutput {
+                        seq_id: finished.seq_id,
+                        text,
+                        token_ids: finished.token_ids,
+                    }));
+            }
+
+            if self.engine.is_finished() && self.pending_events.is_empty() {
+                self.done = true;
+                return None;
+            }
+        }
     }
 }
 

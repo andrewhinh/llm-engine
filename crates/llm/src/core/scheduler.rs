@@ -72,6 +72,29 @@ impl Scheduler {
         Ok(out)
     }
 
+    pub fn contains(&self, seq_id: usize) -> bool {
+        self.waiting.iter().any(|seq| seq.id == seq_id)
+            || self.running.iter().any(|seq| seq.id == seq_id)
+    }
+
+    pub fn cancel(&mut self, seq_id: usize) -> bool {
+        if let Some(pos) = self.waiting.iter().position(|seq| seq.id == seq_id) {
+            let mut seq = self.waiting.remove(pos).expect("waiting position exists");
+            seq.status = SequenceStatus::Finished;
+            self.block_manager.deallocate(&mut seq);
+            return true;
+        }
+
+        if let Some(pos) = self.running.iter().position(|seq| seq.id == seq_id) {
+            let mut seq = self.running.remove(pos).expect("running position exists");
+            seq.status = SequenceStatus::Finished;
+            self.block_manager.deallocate(&mut seq);
+            return true;
+        }
+
+        false
+    }
+
     pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
         let mut scheduled_ids = Vec::new();
         let mut num_seqs = 0usize;

@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::core::GenerationOutput;
+use crate::core::{EngineStream, GenerationOutput};
 use crate::{Engine, EngineConfig, SamplingParams};
 
 #[derive(Debug)]
@@ -21,5 +21,13 @@ impl LLM {
         sampling_params: &[SamplingParams],
     ) -> Result<Vec<GenerationOutput>> {
         self.engine.generate_sync(prompts, sampling_params)
+    }
+
+    pub fn generate_stream<'a>(
+        &'a mut self,
+        prompts: &[String],
+        sampling_params: &[SamplingParams],
+    ) -> Result<EngineStream<'a>> {
+        self.engine.generate_stream(prompts, sampling_params)
     }
 }
