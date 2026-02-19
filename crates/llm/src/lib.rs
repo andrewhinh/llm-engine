@@ -4,6 +4,7 @@ pub mod ipc;
 pub mod models;
 pub mod runner;
 pub mod server;
+pub mod tokenizer;
 pub mod utils;
 
 pub use api::LLM;
@@ -15,4 +16,7 @@ pub use core::{
     StreamOutput, TokenOutput,
 };
 pub use server::{LaunchConfig, ProcessRole};
+pub use tokenizer::{
+    BridgeOutputBatches, DetokenizeManager, TokenizeManager, TokenizerWorkerBridge,
+};
 pub use utils::{EngineConfig, SamplingParams};
