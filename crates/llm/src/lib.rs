@@ -14,4 +14,5 @@ pub use core::{
     CancelledOutput, EngineStream, FinishedOutput, GenerationOutput, PromptInput, StepOutput,
     StreamOutput, TokenOutput,
 };
+pub use server::{LaunchConfig, ProcessRole};
 pub use utils::{EngineConfig, SamplingParams};
