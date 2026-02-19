@@ -149,6 +149,75 @@ impl Attention {
         let probs = softmax_last_dim(&scores)?;
         Ok(probs.matmul(&v)?.transpose(0, 1)?.contiguous()?)
     }
+
+    pub fn forward_decode(
+        &self,
+        query: &Tensor,
+        cache: &KvCache,
+        block_tables: &[Vec<u32>],
+        context_lens: &[usize],
+        block_size: usize,
+    ) -> Result<Tensor> {
+        let (batch_size, q_heads, q_dim) = query.dims3()?;
+        ensure!(batch_size > 0, "decode batch must not be empty");
+        ensure!(q_heads == self.num_heads, "query head count mismatch");
+        ensure!(q_dim == self.head_dim, "query head_dim mismatch");
+        ensure!(
+            block_tables.len() == batch_size,
+            "block_tables rows must match decode batch size"
+        );
+        ensure!(
+            context_lens.len() == batch_size,
+            "context_lens rows must match decode batch size"
+        );
+        ensure!(block_size > 0, "block_size must be positive");
+
+        let mut outputs = Vec::with_capacity(batch_size);
+        for seq_idx in 0..batch_size {
+            let context_len = context_lens[seq_idx];
+            ensure!(context_len > 0, "decode context length must be positive");
+            let table = &block_tables[seq_idx];
+            ensure!(!table.is_empty(), "decode block table must not be empty");
+
+            let mut key_tokens = Vec::with_capacity(context_len);
+            let mut value_tokens = Vec::with_capacity(context_len);
+            for pos in 0..context_len {
+                let slot = slot_for_position(table, pos, block_size)?;
+                let slot_data = cache
+                    .get(slot)
+                    .ok_or_else(|| anyhow::anyhow!("missing kv slot {} in decode cache", slot))?;
+                key_tokens.push(slot_data.key.clone());
+                value_tokens.push(slot_data.value.clone());
+            }
+
+            let key_refs: Vec<&Tensor> = key_tokens.iter().collect();
+            let value_refs: Vec<&Tensor> = value_tokens.iter().collect();
+            let key = Tensor::stack(&key_refs, 0)?;
+            let value = Tensor::stack(&value_refs, 0)?;
+            let query_seq = query.narrow(0, seq_idx, 1)?;
+            let out = self.forward_prefill(&query_seq, &key, &value, false)?;
+            outputs.push(out);
+        }
+
+        let output_refs: Vec<&Tensor> = outputs.iter().collect();
+        Ok(Tensor::cat(&output_refs, 0)?)
+    }
+}
+
+fn slot_for_position(block_table: &[u32], position: usize, block_size: usize) -> Result<usize> {
+    let block_idx = position / block_size;
+    ensure!(
+        block_idx < block_table.len(),
+        "decode block index {} out of range for table length {}",
+        block_idx,
+        block_table.len()
+    );
+    let offset = position % block_size;
+    let base = (block_table[block_idx] as usize)
+        .checked_mul(block_size)
+        .ok_or_else(|| anyhow::anyhow!("slot id overflow"))?;
+    base.checked_add(offset)
+        .ok_or_else(|| anyhow::anyhow!("slot id overflow"))
 }
 
 fn apply_causal_mask(scores: Tensor) -> Result<Tensor> {

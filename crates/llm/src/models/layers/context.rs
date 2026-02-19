@@ -13,6 +13,7 @@ pub struct RuntimeContext {
     pub slot_mapping: Option<Tensor>,
     pub context_lens: Option<Tensor>,
     pub block_tables: Option<Tensor>,
+    pub block_size: usize,
 }
 
 impl RuntimeContext {

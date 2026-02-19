@@ -3,7 +3,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 
 use crate::models::layers::{
-    Attention, KvCache, Linear, LmHead, RmsNorm, RotaryEmbedding, VocabEmbedding,
+    Attention, KvCache, Linear, LmHead, RmsNorm, RotaryEmbedding, VocabEmbedding, get_context,
 };
 use crate::utils::tokenizer::ModelConfig;
 
@@ -309,11 +309,42 @@ impl Qwen3Attention {
         }
 
         let (q, k) = self.rotary.forward(positions, &q, &k)?;
-        if let (Some(slot_mapping), Some(cache)) = (slot_mapping, kv_cache) {
-            self.attn.write_kv_cache(&k, &v, slot_mapping, cache)?;
-        }
-
-        let out = self.attn.forward_prefill(&q, &k, &v, true)?;
+        let context = get_context();
+        let out = match kv_cache {
+            Some(cache) => {
+                if let Some(slot_mapping) = slot_mapping {
+                    self.attn.write_kv_cache(&k, &v, slot_mapping, cache)?;
+                }
+                if context.is_prefill {
+                    self.attn.forward_prefill(&q, &k, &v, true)?
+                } else {
+                    let block_tables_tensor = context
+                        .block_tables
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("decode requires block_tables context"))?;
+                    let block_tables =
+                        block_tables_tensor.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+                    let context_lens_tensor = context
+                        .context_lens
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("decode requires context_lens context"))?;
+                    let context_lens_u32 =
+                        context_lens_tensor.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+                    let context_lens = context_lens_u32
+                        .into_iter()
+                        .map(|len| len as usize)
+                        .collect::<Vec<_>>();
+                    self.attn.forward_decode(
+                        &q,
+                        cache,
+                        &block_tables,
+                        &context_lens,
+                        context.block_size,
+                    )?
+                }
+            }
+            None => self.attn.forward_prefill(&q, &k, &v, true)?,
+        };
         Ok(self
             .o_proj
             .forward(&out.reshape((tokens, self.num_heads * self.head_dim))?)?)
@@ -656,5 +687,9 @@ impl Qwen3ForCausalLM {
 
     pub fn config(&self) -> &Qwen3Config {
         &self.config
+    }
+
+    pub fn device(&self) -> &Device {
+        self.model.embed_tokens.weight().device()
     }
 }
