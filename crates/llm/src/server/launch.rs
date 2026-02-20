@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
 
+use crate::scheduler::io::LLM_SCHED_NAMESPACE_ENV;
+use crate::scheduler::run_scheduler_worker;
 use crate::server::api::{ServerConfig, run_server};
 
 const ROLE_ENV: &str = "LLM_PROCESS_ROLE";
@@ -169,6 +171,9 @@ pub async fn run_worker_role(role: ProcessRole) -> Result<()> {
         role.as_env_value()
     );
     signal_ready(&role)?;
+    if let ProcessRole::Scheduler { rank } = role {
+        return run_scheduler_worker(rank).await;
+    }
     wait_for_shutdown_signal().await
 }
 
@@ -204,11 +209,20 @@ fn create_ack_dir() -> Result<PathBuf> {
 fn spawn_children(config: &LaunchConfig, ack_dir: &Path) -> Result<Vec<ChildProcess>> {
     let exe = env::current_exe().context("failed to resolve current executable path")?;
     let mut children = Vec::new();
+    let sched_namespace = format!(
+        "llm-engine-sched-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
     for role in config.planned_roles() {
         let ready_file = ack_dir.join(role.ready_file_name());
         let child = Command::new(&exe)
             .env(ROLE_ENV, role.as_env_value())
             .env(READY_FILE_ENV, ready_file.as_os_str())
+            .env(LLM_SCHED_NAMESPACE_ENV, sched_namespace.as_str())
             .env(MODEL_ENV, config.server.model.as_str())
             .env(HOST_ENV, config.server.host.as_str())
             .env(PORT_ENV, config.server.port.to_string())
