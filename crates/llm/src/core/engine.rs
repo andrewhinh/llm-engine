@@ -178,11 +178,19 @@ impl Engine {
         prompt: PromptInput<'_>,
         sampling_params: SamplingParams,
     ) -> Result<usize> {
-        sampling_params.validate()?;
         let token_ids = match prompt {
             PromptInput::Text(prompt) => self.encode_prompt(prompt)?,
             PromptInput::TokenIds(token_ids) => token_ids.to_vec(),
         };
+        self.add_tokenized_request(token_ids, sampling_params)
+    }
+
+    pub fn add_tokenized_request(
+        &mut self,
+        token_ids: Vec<u32>,
+        sampling_params: SamplingParams,
+    ) -> Result<usize> {
+        sampling_params.validate()?;
         ensure!(
             !token_ids.is_empty(),
             "prompt must contain at least one token"
