@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use anyhow::{Result, anyhow, ensure};
 
 use crate::core::Sequence;
-use crate::core::prefix_cache_hash::{PrefixCache, PrefixCacheConfig};
+use crate::core::prefix_cache::{PrefixCache, PrefixCacheConfig, PrefixMatch};
 
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -173,7 +173,7 @@ impl BlockManager {
         if let Some(cache) = self.prefix_cache.as_mut() {
             let prefix_match = cache.match_prefix(&seq.token_ids);
             let matched_blocks =
-                Self::adjusted_matched_blocks(seq.token_ids.len(), self.block_size, prefix_match);
+                Self::adjusted_matched_blocks(seq.token_ids.len(), self.block_size, &prefix_match);
             seq.num_blocks().saturating_sub(matched_blocks)
         } else {
             seq.num_blocks()
@@ -183,11 +183,8 @@ impl BlockManager {
     fn allocate_with_prefix(&mut self, seq: &mut Sequence) -> Result<()> {
         let (matched_blocks, matched_block_ids) = if let Some(cache) = self.prefix_cache.as_mut() {
             let prefix_match = cache.match_prefix(&seq.token_ids);
-            let mut matched = Self::adjusted_matched_blocks(
-                seq.token_ids.len(),
-                self.block_size,
-                prefix_match.clone(),
-            );
+            let mut matched =
+                Self::adjusted_matched_blocks(seq.token_ids.len(), self.block_size, &prefix_match);
 
             let mut ids = if let Some(last_hash) = prefix_match.last_hash {
                 let mut ids = cache.blocks_for_match(last_hash);
@@ -339,7 +336,7 @@ impl BlockManager {
     fn adjusted_matched_blocks(
         tokens_len: usize,
         block_size: usize,
-        prefix_match: crate::core::prefix_cache_hash::PrefixMatch,
+        prefix_match: &PrefixMatch,
     ) -> usize {
         let full_blocks = tokens_len / block_size;
         if prefix_match.matched_blocks == full_blocks

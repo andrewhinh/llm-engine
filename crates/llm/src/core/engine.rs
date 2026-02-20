@@ -7,7 +7,7 @@ use candle_core::{DType, Device};
 use tokenizers::Tokenizer;
 use tracing::info;
 
-use crate::core::prefix_cache_hash::PrefixCacheConfig;
+use crate::core::prefix_cache::PrefixCacheConfig;
 use crate::core::{ModelRunner, Scheduler, Sequence};
 use crate::models::{Comm, Qwen3ForCausalLM};
 use crate::runner::Sampler;
@@ -123,7 +123,17 @@ impl Engine {
 
         let num_kvcache_blocks = usize::try_from(config.num_kvcache_blocks)
             .map_err(|_| anyhow!("num_kvcache_blocks must be positive after kv planning"))?;
-        let prefix_cfg = PrefixCacheConfig::default();
+        let mut max_cached_blocks = config
+            .prefix_cache_max_cached_blocks
+            .min(num_kvcache_blocks);
+        if config.prefix_cache_enabled && max_cached_blocks == 0 {
+            max_cached_blocks = num_kvcache_blocks / 2;
+        }
+        let prefix_cfg = PrefixCacheConfig {
+            enabled: config.prefix_cache_enabled && max_cached_blocks > 0,
+            max_cached_blocks,
+            backend: config.prefix_cache_backend,
+        };
         let scheduler = Scheduler::new(&config, prefix_cfg)?;
 
         let device = Device::Cpu;

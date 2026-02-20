@@ -3,7 +3,7 @@ use std::collections::{HashSet, VecDeque};
 use anyhow::{Result, anyhow, ensure};
 
 use crate::core::block_manager::BlockManager;
-use crate::core::prefix_cache_hash::PrefixCacheConfig;
+use crate::core::prefix_cache::PrefixCacheConfig;
 use crate::core::sequence::{Sequence, SequenceStatus};
 use crate::utils::config::EngineConfig;
 

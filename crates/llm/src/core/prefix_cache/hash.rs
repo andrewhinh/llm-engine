@@ -1,23 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-#[derive(Clone, Debug, Default)]
-pub struct PrefixCacheConfig {
-    pub enabled: bool,
-    pub max_cached_blocks: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct PrefixMatch {
-    pub matched_blocks: usize,
-    pub last_hash: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PrefixCacheUpdate {
-    pub inserted: Vec<usize>,
-    pub evicted: Vec<usize>,
-}
+use super::{PrefixCacheConfig, PrefixCacheUpdate, PrefixMatch};
 
 #[derive(Clone, Debug)]
 struct PrefixEntry {
@@ -170,43 +154,6 @@ impl PrefixCache {
 
         let evicted = self.evict_if_needed();
         PrefixCacheUpdate { inserted, evicted }
-    }
-
-    pub fn evict_blocks(&mut self, mut num_blocks: usize) -> Vec<usize> {
-        let mut evicted = Vec::new();
-        while num_blocks > 0 {
-            let Some((hash, access_id)) = self.leaf_lru.pop_front() else {
-                break;
-            };
-            if !self.leaf_set.contains(&hash) {
-                continue;
-            }
-            let Some(entry) = self.entries.get(&hash) else {
-                continue;
-            };
-            if entry.access_id != access_id || entry.children > 0 {
-                continue;
-            }
-
-            let entry = self.entries.remove(&hash).expect("entry must exist");
-            self.leaf_set.remove(&hash);
-            evicted.push(entry.block_id);
-            num_blocks = num_blocks.saturating_sub(1);
-
-            if let Some(parent_hash) = entry.parent
-                && let Some(parent_entry) = self.entries.get_mut(&parent_hash)
-            {
-                if parent_entry.children > 0 {
-                    parent_entry.children -= 1;
-                }
-                if parent_entry.children == 0 {
-                    self.leaf_set.insert(parent_hash);
-                    self.leaf_lru
-                        .push_back((parent_hash, parent_entry.access_id));
-                }
-            }
-        }
-        evicted
     }
 
     pub fn clear(&mut self) -> Vec<usize> {

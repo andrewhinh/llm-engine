@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 
 const MIN_TEMPERATURE: f32 = 1e-10;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefixCacheBackend {
+    #[default]
+    Hash,
+    Radix,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineConfig {
     pub model: String,
@@ -24,6 +32,12 @@ pub struct EngineConfig {
     pub kvcache_block_size: usize,
     #[serde(default = "default_num_kvcache_blocks")]
     pub num_kvcache_blocks: isize,
+    #[serde(default)]
+    pub prefix_cache_enabled: bool,
+    #[serde(default)]
+    pub prefix_cache_max_cached_blocks: usize,
+    #[serde(default)]
+    pub prefix_cache_backend: PrefixCacheBackend,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +53,9 @@ impl Default for EngineConfig {
             eos: default_eos(),
             kvcache_block_size: default_kvcache_block_size(),
             num_kvcache_blocks: default_num_kvcache_blocks(),
+            prefix_cache_enabled: false,
+            prefix_cache_max_cached_blocks: 0,
+            prefix_cache_backend: PrefixCacheBackend::Hash,
         }
     }
 }
