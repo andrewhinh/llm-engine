@@ -3,6 +3,21 @@ use std::cell::RefCell;
 use anyhow::{Result, ensure};
 use candle_core::{DType, Tensor};
 
+#[derive(Debug, Clone)]
+pub struct FlashInferRuntimeMetadata {
+    pub indptr: Tensor,
+    pub indptr_host: Vec<u32>,
+    pub indices: Tensor,
+    pub last_len: Tensor,
+    pub last_len_host: Option<Vec<u32>>,
+    pub kv_len_arr_host: Option<Vec<u32>>,
+    pub cu_seqlens_q_host: Option<Vec<u32>>,
+    pub total_num_rows: Option<u32>,
+    pub batch_indices: Option<Tensor>,
+    pub positions: Option<Tensor>,
+    pub use_cuda_graph: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeContext {
     pub is_prefill: bool,
@@ -14,6 +29,7 @@ pub struct RuntimeContext {
     pub context_lens: Option<Tensor>,
     pub block_tables: Option<Tensor>,
     pub block_size: usize,
+    pub flashinfer: Option<FlashInferRuntimeMetadata>,
 }
 
 impl RuntimeContext {

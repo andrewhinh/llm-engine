@@ -138,8 +138,13 @@ impl Engine {
 
         let device = Device::Cpu;
         let dtype = DType::F32;
-        let mut model =
-            Qwen3ForCausalLM::from_model_config(&model_config, dtype, &device, comm.clone())?;
+        let mut model = Qwen3ForCausalLM::from_model_config(
+            &model_config,
+            dtype,
+            &device,
+            comm.clone(),
+            config.attention_backend_selection()?,
+        )?;
         load_qwen3_weights_from_model_path(&mut model, &config.model, &device)?;
         let sampler = Sampler::from_seed(0);
         let runner = ModelRunner::new(

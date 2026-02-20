@@ -2,10 +2,13 @@ use anyhow::{Result, ensure};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::ops::sigmoid;
 
+use crate::attention::AttentionBackends;
+use crate::models::KvCache;
 use crate::models::layers::{
-    Attention, Comm, KvCache, LmHead, RmsNorm, RotaryEmbedding, TensorParallelColumnLinear,
-    TensorParallelRowLinear, VocabEmbedding, get_context, kv_head_shard, shard_size,
+    Comm, LmHead, RmsNorm, RotaryEmbedding, TensorParallelColumnLinear, TensorParallelRowLinear,
+    VocabEmbedding, get_context, kv_head_shard, shard_size,
 };
+use crate::utils::AttentionBackendSelection;
 use crate::utils::tokenizer::ModelConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,14 +153,20 @@ struct Qwen3Attention {
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
     rotary: RotaryEmbedding,
-    attn: Attention,
+    attn: AttentionBackends,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
 }
 
 impl Qwen3Attention {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
+    fn zeros(
+        config: &Qwen3Config,
+        dtype: DType,
+        device: &Device,
+        comm: &Comm,
+        attention_backend: AttentionBackendSelection,
+    ) -> Result<Self> {
         let local_num_heads = shard_size(config.num_attention_heads, comm.world_size())?;
         let local_num_kv_heads =
             kv_head_shard(config.num_key_value_heads, comm.rank(), comm.world_size())?;
@@ -222,7 +231,13 @@ impl Qwen3Attention {
             config.rope_theta,
             device,
         )?;
-        let attn = Attention::new(local_num_heads, local_num_kv_heads, config.head_dim)?;
+        let attn = AttentionBackends::new(
+            attention_backend,
+            local_num_heads,
+            local_num_kv_heads,
+            config.head_dim,
+            device,
+        )?;
 
         Ok(Self {
             q_proj,
@@ -326,38 +341,24 @@ impl Qwen3Attention {
         let context = get_context();
         let out = match kv_cache {
             Some(cache) => {
+                let backend = if context.is_prefill {
+                    &self.attn.prefill
+                } else {
+                    &self.attn.decode
+                };
                 if let Some(slot_mapping) = slot_mapping {
-                    self.attn.write_kv_cache(&k, &v, slot_mapping, cache)?;
+                    backend.write_kv_cache(&k, &v, slot_mapping, cache)?;
                 }
                 if context.is_prefill {
-                    self.attn.forward_prefill(&q, &k, &v, true)?
+                    backend.forward_prefill(&q, &k, &v, Some(cache), &context)?
                 } else {
-                    let block_tables_tensor = context
-                        .block_tables
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("decode requires block_tables context"))?;
-                    let block_tables =
-                        block_tables_tensor.to_dtype(DType::U32)?.to_vec2::<u32>()?;
-                    let context_lens_tensor = context
-                        .context_lens
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("decode requires context_lens context"))?;
-                    let context_lens_u32 =
-                        context_lens_tensor.to_dtype(DType::U32)?.to_vec1::<u32>()?;
-                    let context_lens = context_lens_u32
-                        .into_iter()
-                        .map(|len| len as usize)
-                        .collect::<Vec<_>>();
-                    self.attn.forward_decode(
-                        &q,
-                        cache,
-                        &block_tables,
-                        &context_lens,
-                        context.block_size,
-                    )?
+                    backend.forward_decode(&q, cache, &context)?
                 }
             }
-            None => self.attn.forward_prefill(&q, &k, &v, true)?,
+            None => self
+                .attn
+                .prefill
+                .forward_prefill(&q, &k, &v, None, &context)?,
         };
         Ok(self
             .o_proj
@@ -456,9 +457,15 @@ struct Qwen3DecoderLayer {
 }
 
 impl Qwen3DecoderLayer {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
+    fn zeros(
+        config: &Qwen3Config,
+        dtype: DType,
+        device: &Device,
+        comm: &Comm,
+        attention_backend: AttentionBackendSelection,
+    ) -> Result<Self> {
         Ok(Self {
-            self_attn: Qwen3Attention::zeros(config, dtype, device, comm)?,
+            self_attn: Qwen3Attention::zeros(config, dtype, device, comm, attention_backend)?,
             mlp: Qwen3Mlp::zeros(config, dtype, device, comm)?,
             input_layernorm: RmsNorm::ones(config.hidden_size, config.rms_norm_eps, dtype, device)?,
             post_attention_layernorm: RmsNorm::ones(
@@ -538,10 +545,22 @@ struct Qwen3Model {
 }
 
 impl Qwen3Model {
-    fn zeros(config: &Qwen3Config, dtype: DType, device: &Device, comm: &Comm) -> Result<Self> {
+    fn zeros(
+        config: &Qwen3Config,
+        dtype: DType,
+        device: &Device,
+        comm: &Comm,
+        attention_backend: AttentionBackendSelection,
+    ) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for _ in 0..config.num_hidden_layers {
-            layers.push(Qwen3DecoderLayer::zeros(config, dtype, device, comm)?);
+            layers.push(Qwen3DecoderLayer::zeros(
+                config,
+                dtype,
+                device,
+                comm,
+                attention_backend,
+            )?);
         }
         Ok(Self {
             embed_tokens: VocabEmbedding::zeros(
@@ -595,10 +614,16 @@ pub struct Qwen3ForCausalLM {
 }
 
 impl Qwen3ForCausalLM {
-    pub fn zeros(config: Qwen3Config, dtype: DType, device: &Device, comm: Comm) -> Result<Self> {
+    pub fn zeros(
+        config: Qwen3Config,
+        dtype: DType,
+        device: &Device,
+        comm: Comm,
+        attention_backend: AttentionBackendSelection,
+    ) -> Result<Self> {
         let local_num_kv_heads =
             kv_head_shard(config.num_key_value_heads, comm.rank(), comm.world_size())?;
-        let model = Qwen3Model::zeros(&config, dtype, device, &comm)?;
+        let model = Qwen3Model::zeros(&config, dtype, device, &comm, attention_backend)?;
         let lm_head = if config.tie_word_embeddings {
             LmHead::new(model.embed_tokens.weight().clone())
         } else {
@@ -618,9 +643,10 @@ impl Qwen3ForCausalLM {
         dtype: DType,
         device: &Device,
         comm: Comm,
+        attention_backend: AttentionBackendSelection,
     ) -> Result<Self> {
         let config = Qwen3Config::from_model_config(model_config)?;
-        Self::zeros(config, dtype, device, comm)
+        Self::zeros(config, dtype, device, comm, attention_backend)
     }
 
     pub fn packed_modules_mapping() -> &'static [PackedModuleMapping] {

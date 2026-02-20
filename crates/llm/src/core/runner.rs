@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow, ensure};
-use candle_core::Tensor;
+use candle_core::{DType, Tensor};
 
 use crate::core::Sequence;
+use crate::models::layers::context::FlashInferRuntimeMetadata;
 use crate::models::{Comm, KvCache, Qwen3ForCausalLM, RuntimeContext, reset_context, set_context};
 use crate::runner::Sampler;
 use crate::utils::{DecodeExecutionPlan, DecodeGraphRuntime};
@@ -38,11 +39,15 @@ impl ModelRunner {
             "num_kvcache_blocks must be positive"
         );
         ensure!(block_size > 0, "block_size must be positive");
-        let num_slots = num_kvcache_blocks
-            .checked_mul(block_size)
-            .ok_or_else(|| anyhow!("num_kvcache_blocks * block_size overflow"))?;
         let cfg = model.config();
-        let kv_cache = KvCache::new(num_slots, model.local_num_kv_heads(), cfg.head_dim)?;
+        let kv_cache = KvCache::new(
+            num_kvcache_blocks,
+            block_size,
+            model.local_num_kv_heads(),
+            cfg.head_dim,
+            DType::F32,
+            model.device(),
+        )?;
         let graph_runtime = DecodeGraphRuntime::new(max_num_seqs, enforce_eager, false);
         Ok(Self {
             model,
@@ -117,8 +122,10 @@ impl ModelRunner {
         let mut max_seqlen_q = 0usize;
         let mut max_seqlen_k = 0usize;
         let mut slot_mapping = Vec::new();
+        let mut prefill_tokens = Vec::with_capacity(seqs.len());
+        let mut batch_indices = Vec::new();
 
-        for seq in seqs {
+        for (seq_idx, seq) in seqs.iter().enumerate() {
             ensure!(
                 seq.len() >= seq.num_cached_tokens,
                 "sequence cached tokens exceed sequence length"
@@ -138,6 +145,8 @@ impl ModelRunner {
             let prefill_end = prefill_start + new_tokens;
             input_ids.extend_from_slice(&seq.token_ids[prefill_start..prefill_end]);
             positions.extend((prefill_start as u32)..(prefill_end as u32));
+            batch_indices.extend(std::iter::repeat_n(seq_idx as u32, new_tokens));
+            prefill_tokens.push(new_tokens);
 
             cu_seqlens_q.push(
                 cu_seqlens_q
@@ -213,8 +222,10 @@ impl ModelRunner {
 
         let device = self.model.device();
         let input_len = input_ids.len();
+        let positions_i64 = positions.iter().map(|&p| p as i64).collect::<Vec<_>>();
         let input_ids = Tensor::from_vec(input_ids, (input_len,), device)?;
         let positions = Tensor::from_vec(positions, (input_len,), device)?;
+        let cu_seqlens_q_host = cu_seqlens_q.clone();
         let q_len = cu_seqlens_q.len();
         let cu_seqlens_q = Tensor::from_vec(cu_seqlens_q, (q_len,), device)?;
         let k_len = cu_seqlens_k.len();
@@ -238,6 +249,13 @@ impl ModelRunner {
         } else {
             None
         };
+        let flashinfer = self.build_flashinfer_prefill_metadata(
+            seqs,
+            &prefill_tokens,
+            &batch_indices,
+            &positions_i64,
+            &cu_seqlens_q_host,
+        )?;
         set_context(RuntimeContext {
             is_prefill: true,
             cu_seqlens_q: Some(cu_seqlens_q),
@@ -248,6 +266,7 @@ impl ModelRunner {
             context_lens,
             block_tables,
             block_size: self.block_size,
+            flashinfer,
         });
 
         Ok(PreparedBatch {
@@ -296,6 +315,7 @@ impl ModelRunner {
         let context_lens_len = context_lens.len();
         let context_lens_tensor = Tensor::from_vec(context_lens, (context_lens_len,), device)?;
         let block_tables = self.prepare_block_tables(seqs)?;
+        let flashinfer = self.build_flashinfer_decode_metadata(seqs)?;
         set_context(RuntimeContext {
             is_prefill: false,
             cu_seqlens_q: None,
@@ -306,6 +326,7 @@ impl ModelRunner {
             context_lens: Some(context_lens_tensor),
             block_tables: Some(block_tables),
             block_size: self.block_size,
+            flashinfer,
         });
 
         Ok(PreparedBatch {
@@ -334,6 +355,153 @@ impl ModelRunner {
             (seqs.len(), max_len),
             self.model.device(),
         )?)
+    }
+
+    fn build_flashinfer_prefill_metadata(
+        &self,
+        seqs: &[&Sequence],
+        prefill_tokens: &[usize],
+        batch_indices: &[u32],
+        positions: &[i64],
+        cu_seqlens_q_host: &[u32],
+    ) -> Result<Option<FlashInferRuntimeMetadata>> {
+        #[cfg(feature = "flashinfer")]
+        {
+            ensure!(
+                seqs.len() == prefill_tokens.len(),
+                "prefill flashinfer metadata expects one token count per sequence"
+            );
+            let mut indptr = vec![0u32];
+            let mut indices = Vec::new();
+            let mut last_len = Vec::new();
+
+            for (seq, &new_tokens) in seqs.iter().zip(prefill_tokens.iter()) {
+                let effective_len = seq.num_cached_tokens + new_tokens;
+                let max_blocks = seq.block_table.len();
+                let num_blocks = if effective_len == 0 {
+                    0
+                } else {
+                    (effective_len + self.block_size - 1) / self.block_size
+                };
+                let num_blocks = num_blocks.min(max_blocks);
+                let table = &seq.block_table[..num_blocks];
+                indices.extend(table.iter().copied());
+                indptr.push(indices.len() as u32);
+                let last = if effective_len == 0 {
+                    0
+                } else {
+                    ((effective_len - 1) % self.block_size + 1) as u32
+                };
+                last_len.push(last);
+            }
+
+            if let Some((pos, bad_idx)) = indices
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, idx)| *idx as usize >= self.kv_cache.num_blocks())
+            {
+                anyhow::bail!(
+                    "flashinfer prefill block index out of range: indices[{pos}]={bad_idx} >= num_blocks ({})",
+                    self.kv_cache.num_blocks()
+                );
+            }
+
+            let kv_len_arr_host = build_kv_len_arr_host(&indptr, &last_len, self.block_size)?;
+            let device = self.model.device();
+            let indptr_tensor = Tensor::from_vec(indptr.clone(), (indptr.len(),), device)?;
+            let indices_tensor = Tensor::from_vec(indices.clone(), (indices.len(),), device)?;
+            let last_len_tensor = Tensor::from_vec(last_len.clone(), (last_len.len(),), device)?;
+            let batch_indices_tensor =
+                Tensor::from_vec(batch_indices.to_vec(), (batch_indices.len(),), device)?;
+            let positions_tensor =
+                Tensor::from_vec(positions.to_vec(), (positions.len(),), device)?;
+
+            return Ok(Some(FlashInferRuntimeMetadata {
+                indptr: indptr_tensor,
+                indptr_host: indptr,
+                indices: indices_tensor,
+                last_len: last_len_tensor,
+                last_len_host: Some(last_len),
+                kv_len_arr_host: Some(kv_len_arr_host),
+                cu_seqlens_q_host: Some(cu_seqlens_q_host.to_vec()),
+                total_num_rows: cu_seqlens_q_host.last().copied(),
+                batch_indices: Some(batch_indices_tensor),
+                positions: Some(positions_tensor),
+                use_cuda_graph: false,
+            }));
+        }
+        #[cfg(not(feature = "flashinfer"))]
+        {
+            let _ = (
+                seqs,
+                prefill_tokens,
+                batch_indices,
+                positions,
+                cu_seqlens_q_host,
+            );
+            Ok(None)
+        }
+    }
+
+    fn build_flashinfer_decode_metadata(
+        &self,
+        seqs: &[&Sequence],
+    ) -> Result<Option<FlashInferRuntimeMetadata>> {
+        #[cfg(feature = "flashinfer")]
+        {
+            let mut indptr = vec![0u32];
+            let mut indices = Vec::new();
+            let mut last_len = Vec::new();
+            for seq in seqs {
+                indices.extend(seq.block_table.iter().copied());
+                indptr.push(indices.len() as u32);
+                let len = seq.len();
+                let last = if len == 0 {
+                    0
+                } else {
+                    ((len - 1) % self.block_size + 1) as u32
+                };
+                last_len.push(last);
+            }
+
+            if let Some((pos, bad_idx)) = indices
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, idx)| *idx as usize >= self.kv_cache.num_blocks())
+            {
+                anyhow::bail!(
+                    "flashinfer decode block index out of range: indices[{pos}]={bad_idx} >= num_blocks ({})",
+                    self.kv_cache.num_blocks()
+                );
+            }
+
+            let kv_len_arr_host = build_kv_len_arr_host(&indptr, &last_len, self.block_size)?;
+            let device = self.model.device();
+            let indptr_tensor = Tensor::from_vec(indptr.clone(), (indptr.len(),), device)?;
+            let indices_tensor = Tensor::from_vec(indices.clone(), (indices.len(),), device)?;
+            let last_len_tensor = Tensor::from_vec(last_len.clone(), (last_len.len(),), device)?;
+
+            return Ok(Some(FlashInferRuntimeMetadata {
+                indptr: indptr_tensor,
+                indptr_host: indptr,
+                indices: indices_tensor,
+                last_len: last_len_tensor,
+                last_len_host: Some(last_len),
+                kv_len_arr_host: Some(kv_len_arr_host),
+                cu_seqlens_q_host: None,
+                total_num_rows: None,
+                batch_indices: None,
+                positions: None,
+                use_cuda_graph: false,
+            }));
+        }
+        #[cfg(not(feature = "flashinfer"))]
+        {
+            let _ = seqs;
+            Ok(None)
+        }
     }
 
     fn sample(&self, logits: &Tensor, seqs: &[&Sequence]) -> Result<Vec<u32>> {
@@ -381,4 +549,25 @@ impl ModelRunner {
         }
         Ok(output)
     }
+}
+
+#[cfg(feature = "flashinfer")]
+fn build_kv_len_arr_host(indptr: &[u32], last_len: &[u32], block_size: usize) -> Result<Vec<u32>> {
+    ensure!(
+        indptr.len() == last_len.len() + 1,
+        "flashinfer indptr size must be last_len size + 1"
+    );
+    let mut out = Vec::with_capacity(last_len.len());
+    for i in 0..last_len.len() {
+        let num_pages = indptr[i + 1] - indptr[i];
+        if num_pages == 0 {
+            out.push(0);
+            continue;
+        }
+        let full = (num_pages - 1)
+            .checked_mul(block_size as u32)
+            .ok_or_else(|| anyhow!("flashinfer kv len overflow"))?;
+        out.push(full + last_len[i]);
+    }
+    Ok(out)
 }

@@ -1,92 +1,19 @@
-use std::collections::HashMap;
-
 use anyhow::{Result, ensure};
-use candle_core::{IndexOp, Tensor};
+use candle_core::Tensor;
 use candle_nn::ops::softmax_last_dim;
 
-#[derive(Debug, Clone)]
-pub struct KvSlot {
-    pub key: Tensor,
-    pub value: Tensor,
-}
+use crate::attention::{AttentionBackend, KvCache};
+use crate::models::layers::context::RuntimeContext;
 
 #[derive(Debug, Clone)]
-pub struct KvCache {
-    num_slots: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    slots: HashMap<usize, KvSlot>,
-}
-
-impl KvCache {
-    pub fn new(num_slots: usize, num_kv_heads: usize, head_dim: usize) -> Result<Self> {
-        ensure!(num_slots > 0, "num_slots must be positive");
-        ensure!(num_kv_heads > 0, "num_kv_heads must be positive");
-        ensure!(head_dim > 0, "head_dim must be positive");
-        Ok(Self {
-            num_slots,
-            num_kv_heads,
-            head_dim,
-            slots: HashMap::new(),
-        })
-    }
-
-    pub fn write_from_mapping(
-        &mut self,
-        key: &Tensor,
-        value: &Tensor,
-        slot_mapping: &[i32],
-    ) -> Result<()> {
-        ensure!(key.dims() == value.dims(), "key/value shapes must match");
-        let (tokens, kv_heads, head_dim) = key.dims3()?;
-        ensure!(
-            kv_heads == self.num_kv_heads && head_dim == self.head_dim,
-            "key/value shape must match cache dimensions"
-        );
-        ensure!(
-            slot_mapping.len() == tokens,
-            "slot_mapping must have one entry per token"
-        );
-
-        for (token_idx, &slot) in slot_mapping.iter().enumerate() {
-            if slot < 0 {
-                continue;
-            }
-            let slot = slot as usize;
-            ensure!(slot < self.num_slots, "slot index out of range");
-            self.slots.insert(
-                slot,
-                KvSlot {
-                    key: key.i(token_idx)?.contiguous()?,
-                    value: value.i(token_idx)?.contiguous()?,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    pub fn get(&self, slot: usize) -> Option<&KvSlot> {
-        self.slots.get(&slot)
-    }
-
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Attention {
+pub struct EagerAttentionBackend {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     scale: f64,
 }
 
-impl Attention {
+impl EagerAttentionBackend {
     pub fn new(num_heads: usize, num_kv_heads: usize, head_dim: usize) -> Result<Self> {
         ensure!(num_heads > 0, "num_heads must be positive");
         ensure!(num_kv_heads > 0, "num_kv_heads must be positive");
@@ -103,17 +30,7 @@ impl Attention {
         })
     }
 
-    pub fn write_kv_cache(
-        &self,
-        key: &Tensor,
-        value: &Tensor,
-        slot_mapping: &[i32],
-        cache: &mut KvCache,
-    ) -> Result<()> {
-        cache.write_from_mapping(key, value, slot_mapping)
-    }
-
-    pub fn forward_prefill(
+    fn forward_prefill_inner(
         &self,
         query: &Tensor,
         key: &Tensor,
@@ -150,18 +67,31 @@ impl Attention {
         Ok(probs.matmul(&v)?.transpose(0, 1)?.contiguous()?)
     }
 
-    pub fn forward_decode(
+    fn forward_decode_inner(
         &self,
         query: &Tensor,
         cache: &KvCache,
-        block_tables: &[Vec<u32>],
-        context_lens: &[usize],
-        block_size: usize,
+        ctx: &RuntimeContext,
     ) -> Result<Tensor> {
         let (batch_size, q_heads, q_dim) = query.dims3()?;
         ensure!(batch_size > 0, "decode batch must not be empty");
         ensure!(q_heads == self.num_heads, "query head count mismatch");
         ensure!(q_dim == self.head_dim, "query head_dim mismatch");
+        let block_tables_tensor = ctx
+            .block_tables
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("decode requires block_tables context"))?;
+        let block_tables = block_tables_tensor.to_vec2::<u32>()?;
+        let context_lens_tensor = ctx
+            .context_lens
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("decode requires context_lens context"))?;
+        let context_lens = context_lens_tensor
+            .to_vec1::<u32>()?
+            .into_iter()
+            .map(|len| len as usize)
+            .collect::<Vec<_>>();
+
         ensure!(
             block_tables.len() == batch_size,
             "block_tables rows must match decode batch size"
@@ -170,7 +100,7 @@ impl Attention {
             context_lens.len() == batch_size,
             "context_lens rows must match decode batch size"
         );
-        ensure!(block_size > 0, "block_size must be positive");
+        ensure!(ctx.block_size > 0, "block_size must be positive");
 
         let mut outputs = Vec::with_capacity(batch_size);
         for seq_idx in 0..batch_size {
@@ -182,9 +112,9 @@ impl Attention {
             let mut key_tokens = Vec::with_capacity(context_len);
             let mut value_tokens = Vec::with_capacity(context_len);
             for pos in 0..context_len {
-                let slot = slot_for_position(table, pos, block_size)?;
+                let slot = slot_for_position(table, pos, ctx.block_size)?;
                 let slot_data = cache
-                    .get(slot)
+                    .read_slot(slot)?
                     .ok_or_else(|| anyhow::anyhow!("missing kv slot {} in decode cache", slot))?;
                 key_tokens.push(slot_data.key.clone());
                 value_tokens.push(slot_data.value.clone());
@@ -195,12 +125,48 @@ impl Attention {
             let key = Tensor::stack(&key_refs, 0)?;
             let value = Tensor::stack(&value_refs, 0)?;
             let query_seq = query.narrow(0, seq_idx, 1)?;
-            let out = self.forward_prefill(&query_seq, &key, &value, false)?;
+            let out = self.forward_prefill_inner(&query_seq, &key, &value, false)?;
             outputs.push(out);
         }
 
         let output_refs: Vec<&Tensor> = outputs.iter().collect();
         Ok(Tensor::cat(&output_refs, 0)?)
+    }
+}
+
+impl AttentionBackend for EagerAttentionBackend {
+    fn name(&self) -> &'static str {
+        "eager"
+    }
+
+    fn write_kv_cache(
+        &self,
+        key: &Tensor,
+        value: &Tensor,
+        slot_mapping: &[i32],
+        cache: &mut KvCache,
+    ) -> Result<()> {
+        cache.write_from_mapping(key, value, slot_mapping)
+    }
+
+    fn forward_prefill(
+        &self,
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        _cache: Option<&KvCache>,
+        _ctx: &RuntimeContext,
+    ) -> Result<Tensor> {
+        self.forward_prefill_inner(query, key, value, true)
+    }
+
+    fn forward_decode(
+        &self,
+        query: &Tensor,
+        cache: &KvCache,
+        ctx: &RuntimeContext,
+    ) -> Result<Tensor> {
+        self.forward_decode_inner(query, cache, ctx)
     }
 }
 

@@ -4,7 +4,10 @@ pub mod kvcache_allocator;
 pub mod loader;
 pub mod tokenizer;
 
-pub use config::{EngineConfig, PrefixCacheBackend, SamplingParams};
+pub use config::{
+    AttentionBackendKind, AttentionBackendSelection, EngineConfig, PrefixCacheBackend,
+    SamplingParams, parse_attention_backend,
+};
 pub use graph::{DecodeExecutionPlan, DecodeGraphRuntime, planned_decode_graph_batches};
 pub use kvcache_allocator::{KVCacheAllocator, KVCachePlan};
 pub use loader::{

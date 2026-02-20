@@ -1,4 +1,5 @@
 pub mod api;
+pub mod attention;
 pub mod core;
 pub mod ipc;
 pub mod models;

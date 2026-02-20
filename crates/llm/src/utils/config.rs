@@ -11,6 +11,21 @@ pub enum PrefixCacheBackend {
     Radix,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AttentionBackendKind {
+    #[default]
+    Eager,
+    Fa,
+    Fi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionBackendSelection {
+    pub prefill: AttentionBackendKind,
+    pub decode: AttentionBackendKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineConfig {
     pub model: String,
@@ -40,6 +55,8 @@ pub struct EngineConfig {
     pub prefix_cache_max_cached_blocks: usize,
     #[serde(default)]
     pub prefix_cache_backend: PrefixCacheBackend,
+    #[serde(default = "default_attention_backend")]
+    pub attention_backend: String,
 }
 
 impl Default for EngineConfig {
@@ -59,6 +76,7 @@ impl Default for EngineConfig {
             prefix_cache_enabled: false,
             prefix_cache_max_cached_blocks: 0,
             prefix_cache_backend: PrefixCacheBackend::Hash,
+            attention_backend: default_attention_backend(),
         }
     }
 }
@@ -96,7 +114,12 @@ impl EngineConfig {
             self.num_kvcache_blocks == -1 || self.num_kvcache_blocks > 0,
             "num_kvcache_blocks must be -1 or positive"
         );
+        parse_attention_backend(&self.attention_backend)?;
         Ok(())
+    }
+
+    pub fn attention_backend_selection(&self) -> Result<AttentionBackendSelection> {
+        parse_attention_backend(&self.attention_backend)
     }
 }
 
@@ -209,4 +232,45 @@ const fn default_top_k() -> isize {
 
 const fn default_top_p() -> f32 {
     1.0
+}
+
+fn default_attention_backend() -> String {
+    "eager".to_string()
+}
+
+pub fn parse_attention_backend(raw: &str) -> Result<AttentionBackendSelection> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    ensure!(
+        !normalized.is_empty(),
+        "attention_backend must not be empty"
+    );
+
+    if normalized.contains(',') {
+        let mut parts = normalized.split(',');
+        let prefill_raw = parts.next().unwrap_or_default().trim();
+        let decode_raw = parts.next().unwrap_or_default().trim();
+        ensure!(
+            parts.next().is_none(),
+            "attention_backend split form must be '<prefill>,<decode>'"
+        );
+        let prefill = parse_attention_backend_kind(prefill_raw)?;
+        let decode = parse_attention_backend_kind(decode_raw)?;
+        return Ok(AttentionBackendSelection { prefill, decode });
+    }
+
+    let backend = parse_attention_backend_kind(&normalized)?;
+    Ok(AttentionBackendSelection {
+        prefill: backend,
+        decode: backend,
+    })
+}
+
+fn parse_attention_backend_kind(raw: &str) -> Result<AttentionBackendKind> {
+    ensure!(!raw.is_empty(), "attention backend entry must not be empty");
+    match raw {
+        "eager" => Ok(AttentionBackendKind::Eager),
+        "fa" | "flash-attn" | "flash_attention" | "flashattention" => Ok(AttentionBackendKind::Fa),
+        "fi" | "flashinfer" | "flash-infer" => Ok(AttentionBackendKind::Fi),
+        _ => anyhow::bail!("unsupported attention backend '{raw}', expected one of: eager, fa, fi"),
+    }
 }
