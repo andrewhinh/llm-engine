@@ -124,9 +124,20 @@ impl ModelRunner {
                 "sequence cached tokens exceed sequence length"
             );
             let seq_len = seq.len();
-            let new_tokens = seq_len - seq.num_cached_tokens;
-            input_ids.extend_from_slice(&seq.token_ids[seq.num_cached_tokens..]);
-            positions.extend((seq.num_cached_tokens as u32)..(seq_len as u32));
+            let remaining_tokens = seq_len - seq.num_cached_tokens;
+            let new_tokens = if seq.prefill_chunk_tokens > 0 {
+                seq.prefill_chunk_tokens.min(remaining_tokens)
+            } else {
+                remaining_tokens
+            };
+            ensure!(
+                new_tokens > 0,
+                "prefill sequence must contribute at least one token"
+            );
+            let prefill_start = seq.num_cached_tokens;
+            let prefill_end = prefill_start + new_tokens;
+            input_ids.extend_from_slice(&seq.token_ids[prefill_start..prefill_end]);
+            positions.extend((prefill_start as u32)..(prefill_end as u32));
 
             cu_seqlens_q.push(
                 cu_seqlens_q

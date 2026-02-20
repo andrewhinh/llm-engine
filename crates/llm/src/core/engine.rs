@@ -209,7 +209,7 @@ impl Engine {
         }
 
         let (scheduled_ids, is_prefill) = self.scheduler.schedule()?;
-        let (seq_snapshots, output_ids, num_tokens) = {
+        let (output_ids, num_tokens) = {
             let seqs = self.scheduler.get_running_sequences(&scheduled_ids)?;
             let output_ids = self.runner.run(&seqs, is_prefill)?;
             ensure!(
@@ -217,45 +217,38 @@ impl Engine {
                 "runner output size mismatch"
             );
             let num_tokens = if is_prefill {
-                seqs.iter().map(|seq| seq.len()).sum::<usize>() as isize
+                seqs.iter()
+                    .map(|seq| {
+                        if seq.prefill_chunk_tokens > 0 {
+                            seq.prefill_chunk_tokens
+                        } else {
+                            seq.remaining_prefill_tokens()
+                        }
+                    })
+                    .sum::<usize>() as isize
             } else {
                 -(seqs.len() as isize)
             };
-            let seq_snapshots = seqs.iter().map(|seq| (*seq).clone()).collect::<Vec<_>>();
-            (seq_snapshots, output_ids, num_tokens)
+            (output_ids, num_tokens)
         };
 
-        let eos = u32::try_from(self.config.eos)
-            .map_err(|_| anyhow!("engine eos must be non-negative during stepping"))?;
-        let mut finished_ids = HashSet::new();
-        let finished = seq_snapshots
-            .iter()
-            .zip(output_ids.iter())
-            .filter_map(|(seq, token_id)| {
-                if is_sequence_finished(seq, *token_id, eos) {
-                    finished_ids.insert(seq.id);
-                    let mut token_ids = seq.completion_token_ids().to_vec();
-                    token_ids.push(*token_id);
-                    Some(FinishedOutput {
-                        seq_id: seq.id,
-                        token_ids,
-                    })
-                } else {
-                    None
-                }
+        let postprocess = self
+            .scheduler
+            .postprocess(&scheduled_ids, &output_ids, is_prefill)?;
+        let finished = postprocess
+            .finished
+            .into_iter()
+            .map(|(seq_id, token_ids)| FinishedOutput { seq_id, token_ids })
+            .collect::<Vec<_>>();
+        let tokens = postprocess
+            .tokens
+            .into_iter()
+            .map(|token| TokenOutput {
+                seq_id: token.seq_id,
+                token_id: token.token_id,
+                finished: token.finished,
             })
             .collect::<Vec<_>>();
-        let tokens = seq_snapshots
-            .iter()
-            .zip(output_ids.iter())
-            .map(|(seq, token_id)| TokenOutput {
-                seq_id: seq.id,
-                token_id: *token_id,
-                finished: finished_ids.contains(&seq.id),
-            })
-            .collect::<Vec<_>>();
-
-        self.scheduler.postprocess(&scheduled_ids, &output_ids)?;
         for finished in &finished {
             self.active_requests.remove(&finished.seq_id);
         }
@@ -449,12 +442,6 @@ impl<'a> Iterator for EngineStream<'a> {
             }
         }
     }
-}
-
-fn is_sequence_finished(seq: &Sequence, next_token: u32, eos_token_id: u32) -> bool {
-    let reached_eos = !seq.sampling_params.ignore_eos && next_token == eos_token_id;
-    let reached_max = seq.num_completion_tokens() + 1 == seq.sampling_params.max_tokens;
-    reached_eos || reached_max
 }
 
 fn expand_sampling_params(

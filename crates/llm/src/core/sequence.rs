@@ -16,6 +16,7 @@ pub struct Sequence {
     pub num_tokens: usize,
     pub num_prompt_tokens: usize,
     pub num_cached_tokens: usize,
+    pub prefill_chunk_tokens: usize,
     pub block_table: Vec<u32>,
     pub block_size: usize,
     pub sampling_params: SamplingParams,
@@ -34,6 +35,7 @@ impl Sequence {
             num_tokens,
             num_prompt_tokens: num_tokens,
             num_cached_tokens: 0,
+            prefill_chunk_tokens: 0,
             block_table: Vec::new(),
             block_size,
             sampling_params,
@@ -87,5 +89,13 @@ impl Sequence {
         self.token_ids.push(token_id);
         self.last_token = token_id;
         self.num_tokens += 1;
+    }
+
+    pub fn remaining_prefill_tokens(&self) -> usize {
+        self.num_tokens.saturating_sub(self.num_cached_tokens)
+    }
+
+    pub fn clear_prefill_chunk_tokens(&mut self) {
+        self.prefill_chunk_tokens = 0;
     }
 }

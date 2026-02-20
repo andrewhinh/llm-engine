@@ -5,12 +5,27 @@ use anyhow::{Result, anyhow, ensure};
 use crate::core::block_manager::BlockManager;
 use crate::core::prefix_cache::PrefixCacheConfig;
 use crate::core::sequence::{Sequence, SequenceStatus};
+use crate::scheduler::{PrefillBudget, PrefillPolicy};
 use crate::utils::config::EngineConfig;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostprocessToken {
+    pub seq_id: usize,
+    pub token_id: u32,
+    pub finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostprocessOutput {
+    pub tokens: Vec<PostprocessToken>,
+    pub finished: Vec<(usize, Vec<u32>)>,
+}
 
 #[derive(Debug)]
 pub struct Scheduler {
     max_num_seqs: usize,
     max_num_batched_tokens: usize,
+    max_prefill_tokens: usize,
     eos_token_id: u32,
     pub block_manager: BlockManager,
     waiting: VecDeque<Sequence>,
@@ -29,6 +44,7 @@ impl Scheduler {
         Ok(Self {
             max_num_seqs: config.max_num_seqs,
             max_num_batched_tokens: config.max_num_batched_tokens,
+            max_prefill_tokens: config.max_prefill_tokens,
             eos_token_id,
             block_manager: BlockManager::new(num_blocks, config.kvcache_block_size, prefix_cfg),
             waiting: VecDeque::new(),
@@ -99,20 +115,42 @@ impl Scheduler {
         let mut scheduled_ids = Vec::new();
         let mut num_seqs = 0usize;
         let mut num_batched_tokens = 0usize;
+        let mut prefill_budget = PrefillBudget::new(PrefillPolicy {
+            max_prefill_tokens: self.max_prefill_tokens,
+            max_num_batched_tokens: self.max_num_batched_tokens,
+        });
 
-        while !self.waiting.is_empty() && num_seqs < self.max_num_seqs {
+        while !self.waiting.is_empty()
+            && num_seqs < self.max_num_seqs
+            && !prefill_budget.is_exhausted()
+        {
             let should_break = {
                 let seq = self.waiting.front().expect("waiting is not empty");
-                num_batched_tokens + seq.len() > self.max_num_batched_tokens
-                    || !self.block_manager.can_allocate(seq)
+                let max_batch_tokens_left = self
+                    .max_num_batched_tokens
+                    .saturating_sub(num_batched_tokens);
+                let chunk_tokens = prefill_budget
+                    .plan_chunk(seq.remaining_prefill_tokens(), max_batch_tokens_left);
+                chunk_tokens == 0
+                    || (seq.block_table.is_empty() && !self.block_manager.can_allocate(seq))
             };
             if should_break {
                 break;
             }
 
             let mut seq = self.waiting.pop_front().expect("waiting is not empty");
-            self.block_manager.allocate(&mut seq)?;
-            num_batched_tokens += seq.len().saturating_sub(seq.num_cached_tokens);
+            if seq.block_table.is_empty() {
+                self.block_manager.allocate(&mut seq)?;
+            }
+            let max_batch_tokens_left = self
+                .max_num_batched_tokens
+                .saturating_sub(num_batched_tokens);
+            let chunk_tokens =
+                prefill_budget.plan_chunk(seq.remaining_prefill_tokens(), max_batch_tokens_left);
+            ensure!(chunk_tokens > 0, "prefill chunk size must be positive");
+            seq.prefill_chunk_tokens = chunk_tokens;
+            num_batched_tokens += chunk_tokens;
+            prefill_budget.consume(chunk_tokens);
             seq.status = SequenceStatus::Running;
             scheduled_ids.push(seq.id);
             self.running.push_back(seq);
@@ -161,13 +199,20 @@ impl Scheduler {
         Ok((scheduled_ids, false))
     }
 
-    pub fn postprocess(&mut self, seq_ids: &[usize], output_ids: &[u32]) -> Result<Vec<usize>> {
+    pub fn postprocess(
+        &mut self,
+        seq_ids: &[usize],
+        output_ids: &[u32],
+        is_prefill: bool,
+    ) -> Result<PostprocessOutput> {
         ensure!(
             seq_ids.len() == output_ids.len(),
             "postprocess input size mismatch"
         );
 
+        let mut emitted_tokens = Vec::with_capacity(seq_ids.len());
         let mut finished_ids = Vec::new();
+        let mut requeue_ids = Vec::new();
         for (&seq_id, &token_id) in seq_ids.iter().zip(output_ids.iter()) {
             let seq = self
                 .running
@@ -175,33 +220,82 @@ impl Scheduler {
                 .find(|seq| seq.id == seq_id)
                 .ok_or_else(|| anyhow!("running sequence {} not found", seq_id))?;
 
+            if is_prefill {
+                let consumed_prefill_tokens = if seq.prefill_chunk_tokens > 0 {
+                    seq.prefill_chunk_tokens.min(seq.remaining_prefill_tokens())
+                } else {
+                    seq.remaining_prefill_tokens()
+                };
+                ensure!(
+                    consumed_prefill_tokens > 0,
+                    "prefill postprocess requires positive consumed tokens"
+                );
+                seq.num_cached_tokens = seq
+                    .num_cached_tokens
+                    .saturating_add(consumed_prefill_tokens)
+                    .min(seq.len());
+                seq.clear_prefill_chunk_tokens();
+
+                if seq.num_cached_tokens < seq.len() {
+                    seq.status = SequenceStatus::Waiting;
+                    requeue_ids.push(seq.id);
+                    continue;
+                }
+            } else {
+                seq.clear_prefill_chunk_tokens();
+            }
+
             seq.append_token(token_id);
             let reached_eos = !seq.sampling_params.ignore_eos && token_id == self.eos_token_id;
             let reached_max = seq.num_completion_tokens() == seq.sampling_params.max_tokens;
             if reached_eos || reached_max {
                 seq.status = SequenceStatus::Finished;
                 finished_ids.push(seq.id);
+                emitted_tokens.push(PostprocessToken {
+                    seq_id: seq.id,
+                    token_id,
+                    finished: true,
+                });
+            } else {
+                emitted_tokens.push(PostprocessToken {
+                    seq_id: seq.id,
+                    token_id,
+                    finished: false,
+                });
             }
         }
 
-        if finished_ids.is_empty() {
-            return Ok(finished_ids);
+        if finished_ids.is_empty() && requeue_ids.is_empty() {
+            return Ok(PostprocessOutput {
+                tokens: emitted_tokens,
+                finished: Vec::new(),
+            });
         }
 
         let finished_set: HashSet<usize> = finished_ids.iter().copied().collect();
+        let requeue_set: HashSet<usize> = requeue_ids.iter().copied().collect();
+        let mut finished = Vec::new();
         let mut kept = VecDeque::with_capacity(self.running.len());
         while let Some(mut seq) = self.running.pop_front() {
             if finished_set.contains(&seq.id) {
+                finished.push((seq.id, seq.completion_token_ids().to_vec()));
                 self.block_manager.deallocate(&mut seq);
+            } else if requeue_set.contains(&seq.id) {
+                seq.status = SequenceStatus::Waiting;
+                self.waiting.push_back(seq);
             } else {
                 kept.push_back(seq);
             }
         }
         self.running = kept;
-        Ok(finished_ids)
+        Ok(PostprocessOutput {
+            tokens: emitted_tokens,
+            finished,
+        })
     }
 
     fn preempt(&mut self, mut seq: Sequence) {
+        seq.clear_prefill_chunk_tokens();
         seq.status = SequenceStatus::Waiting;
         self.block_manager.deallocate(&mut seq);
         self.waiting.push_front(seq);

@@ -16,6 +16,8 @@ pub struct EngineConfig {
     pub model: String,
     #[serde(default = "default_max_num_batched_tokens")]
     pub max_num_batched_tokens: usize,
+    #[serde(default = "default_max_prefill_tokens")]
+    pub max_prefill_tokens: usize,
     #[serde(default = "default_max_num_seqs")]
     pub max_num_seqs: usize,
     #[serde(default = "default_max_model_len")]
@@ -45,6 +47,7 @@ impl Default for EngineConfig {
         Self {
             model: String::new(),
             max_num_batched_tokens: default_max_num_batched_tokens(),
+            max_prefill_tokens: default_max_prefill_tokens(),
             max_num_seqs: default_max_num_seqs(),
             max_model_len: default_max_model_len(),
             gpu_memory_utilization: default_gpu_memory_utilization(),
@@ -66,6 +69,10 @@ impl EngineConfig {
         ensure!(
             self.max_num_batched_tokens > 0,
             "max_num_batched_tokens must be positive"
+        );
+        ensure!(
+            self.max_prefill_tokens > 0,
+            "max_prefill_tokens must be positive"
         );
         ensure!(self.max_num_seqs > 0, "max_num_seqs must be positive");
         ensure!(self.max_model_len > 0, "max_model_len must be positive");
@@ -154,6 +161,10 @@ impl SamplingParams {
 
 const fn default_max_num_batched_tokens() -> usize {
     16_384
+}
+
+const fn default_max_prefill_tokens() -> usize {
+    8_192
 }
 
 const fn default_max_num_seqs() -> usize {
