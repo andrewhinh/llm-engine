@@ -1,9 +1,13 @@
 use std::convert::Infallible;
 use std::env;
+use std::fs;
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::Event;
@@ -17,8 +21,14 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::StreamOutput;
 use crate::api::LLM;
+use crate::ipc::{
+    FrontendToTokenizerBatch, FrontendToTokenizerMsg, PromptPayload, TokenizeRequest,
+    TokenizerToFrontendBatch, TokenizerToFrontendMsg,
+};
 use crate::server::streaming::{chunk_event, done_event, finish_chunk, token_chunk};
+use crate::tokenizer::{frontend_reply_path, frontend_to_tokenizer_path};
 use crate::utils::config::{EngineConfig, SamplingParams};
+use crate::utils::tokenizer::{encode_prompt, load_tokenizer};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -43,8 +53,28 @@ impl ServerConfig {
 
 #[derive(Clone)]
 struct ServerState {
-    llm: Arc<Mutex<LLM>>,
+    backend: Arc<ServerBackend>,
     model_id: String,
+}
+
+enum ServerBackend {
+    Local {
+        llm: Box<Mutex<LLM>>,
+    },
+    Worker {
+        client: Box<Mutex<WorkerFrontendClient>>,
+    },
+}
+
+struct WorkerFrontendClient {
+    namespace: String,
+    tokenizer_workers: usize,
+    next_worker: usize,
+    request_seq: AtomicU64,
+    send_socket: UnixDatagram,
+    recv_socket: UnixDatagram,
+    recv_path: PathBuf,
+    tokenizer: tokenizers::Tokenizer,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,14 +149,22 @@ struct HealthResponse {
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
-    let engine_config = EngineConfig {
-        model: config.model.clone(),
-        ..EngineConfig::default()
+    let backend = if should_use_worker_backend() {
+        Arc::new(ServerBackend::Worker {
+            client: Box::new(Mutex::new(WorkerFrontendClient::from_env(&config.model)?)),
+        })
+    } else {
+        let engine_config = EngineConfig {
+            model: config.model.clone(),
+            ..EngineConfig::default()
+        };
+        Arc::new(ServerBackend::Local {
+            llm: Box::new(Mutex::new(LLM::new(engine_config)?)),
+        })
     };
-    let llm = LLM::new(engine_config)?;
 
     let state = ServerState {
-        llm: Arc::new(Mutex::new(llm)),
+        backend,
         model_id: config.model,
     };
 
@@ -182,17 +220,28 @@ async fn v1_chat_completions(
     }
 
     match tokio::task::spawn_blocking(move || -> Result<(usize, String, Vec<u32>)> {
-        let mut llm = state
-            .llm
-            .lock()
-            .map_err(|_| anyhow!("failed to acquire llm lock"))?;
-        let prompt_tokens = llm.count_prompt_tokens(&prompt)?;
-        let prompts = vec![prompt];
-        let params = vec![sampling];
-        let mut outputs = llm.generate(&prompts, &params)?;
-        ensure!(!outputs.is_empty(), "engine returned no outputs");
-        let output = outputs.remove(0);
-        Ok((prompt_tokens, output.text, output.token_ids))
+        match &*state.backend {
+            ServerBackend::Local { llm } => {
+                let mut llm = llm
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                let prompt_tokens = llm.count_prompt_tokens(&prompt)?;
+                let prompts = vec![prompt];
+                let params = vec![sampling];
+                let mut outputs = llm.generate(&prompts, &params)?;
+                ensure!(!outputs.is_empty(), "engine returned no outputs");
+                let output = outputs.remove(0);
+                Ok((prompt_tokens, output.text, output.token_ids))
+            }
+            ServerBackend::Worker { client } => {
+                let mut client = client
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                let prompt_tokens = client.count_prompt_tokens(&prompt)?;
+                let (text, chunk_count) = client.generate_sync(prompt, sampling)?;
+                Ok((prompt_tokens, text, vec![0u32; chunk_count]))
+            }
+        }
     })
     .await
     {
@@ -248,50 +297,84 @@ fn stream_chat_completion(
         let mut sent_first_role = false;
 
         let result = (|| -> Result<()> {
-            let mut llm = state
-                .llm
-                .lock()
-                .map_err(|_| anyhow!("failed to acquire llm lock"))?;
-            let prompts = vec![prompt];
-            let params = vec![sampling];
-            let stream = llm.generate_stream(&prompts, &params)?;
+            match &*state.backend {
+                ServerBackend::Local { llm } => {
+                    let mut llm = llm
+                        .lock()
+                        .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                    let prompts = vec![prompt];
+                    let params = vec![sampling];
+                    let stream = llm.generate_stream(&prompts, &params)?;
 
-            for item in stream {
-                match item? {
-                    StreamOutput::Token { text, .. } => {
+                    for item in stream {
+                        match item? {
+                            StreamOutput::Token { text, .. } => {
+                                let chunk = token_chunk(
+                                    &completion_id,
+                                    created,
+                                    &model,
+                                    text,
+                                    !sent_first_role,
+                                );
+                                sent_first_role = true;
+                                if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            StreamOutput::Done(_) => {
+                                let chunk = finish_chunk(&completion_id, created, &model);
+                                if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
+                                    return Ok(());
+                                }
+                                if tx.blocking_send(Ok(done_event())).is_err() {
+                                    return Ok(());
+                                }
+                                sent_terminal = true;
+                                return Ok(());
+                            }
+                            StreamOutput::Cancelled(_) => {
+                                if tx
+                                    .blocking_send(Ok(
+                                        Event::default().data("{\"error\":\"request cancelled\"}")
+                                    ))
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                                if tx.blocking_send(Ok(done_event())).is_err() {
+                                    return Ok(());
+                                }
+                                sent_terminal = true;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                ServerBackend::Worker { client } => {
+                    let mut client = client
+                        .lock()
+                        .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                    client.stream(prompt, sampling, |delta| {
+                        if delta.is_empty() {
+                            return Ok(());
+                        }
                         let chunk =
-                            token_chunk(&completion_id, created, &model, text, !sent_first_role);
+                            token_chunk(&completion_id, created, &model, delta, !sent_first_role);
                         sent_first_role = true;
                         if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
                             return Ok(());
                         }
-                    }
-                    StreamOutput::Done(_) => {
-                        let chunk = finish_chunk(&completion_id, created, &model);
-                        if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
-                            return Ok(());
-                        }
-                        if tx.blocking_send(Ok(done_event())).is_err() {
-                            return Ok(());
-                        }
-                        sent_terminal = true;
+                        Ok(())
+                    })?;
+                    let chunk = finish_chunk(&completion_id, created, &model);
+                    if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
                         return Ok(());
                     }
-                    StreamOutput::Cancelled(_) => {
-                        if tx
-                            .blocking_send(Ok(
-                                Event::default().data("{\"error\":\"request cancelled\"}")
-                            ))
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-                        if tx.blocking_send(Ok(done_event())).is_err() {
-                            return Ok(());
-                        }
-                        sent_terminal = true;
+                    if tx.blocking_send(Ok(done_event())).is_err() {
                         return Ok(());
                     }
+                    sent_terminal = true;
+                    return Ok(());
                 }
             }
             Ok(())
@@ -367,4 +450,139 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn should_use_worker_backend() -> bool {
+    env::var("LLM_SCHED_NAMESPACE").is_ok()
+        && env::var("LLM_PROCESS_ROLE")
+            .ok()
+            .as_deref()
+            .map(|role| role == "frontend")
+            .unwrap_or(false)
+}
+
+impl WorkerFrontendClient {
+    fn from_env(model: &str) -> Result<Self> {
+        let namespace = env::var("LLM_SCHED_NAMESPACE")
+            .map_err(|_| anyhow!("missing LLM_SCHED_NAMESPACE for worker frontend mode"))?;
+        let tokenizer_workers = env::var("LLM_TOKENIZER_WORKERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(0)
+            .max(1);
+        let recv_path = frontend_reply_path(&namespace);
+        if recv_path.exists() {
+            fs::remove_file(&recv_path).with_context(|| {
+                format!(
+                    "failed removing stale frontend reply socket {}",
+                    recv_path.display()
+                )
+            })?;
+        }
+        let recv_socket = UnixDatagram::bind(&recv_path).with_context(|| {
+            format!(
+                "failed binding frontend reply socket {}",
+                recv_path.display()
+            )
+        })?;
+        let send_socket =
+            UnixDatagram::unbound().context("failed creating frontend send socket")?;
+        let tokenizer = load_tokenizer(Path::new(model))?;
+        Ok(Self {
+            namespace,
+            tokenizer_workers,
+            next_worker: 0,
+            request_seq: AtomicU64::new(1),
+            send_socket,
+            recv_socket,
+            recv_path,
+            tokenizer,
+        })
+    }
+
+    fn count_prompt_tokens(&self, prompt: &str) -> Result<usize> {
+        Ok(encode_prompt(&self.tokenizer, prompt)?.len())
+    }
+
+    fn generate_sync(
+        &mut self,
+        prompt: String,
+        sampling: SamplingParams,
+    ) -> Result<(String, usize)> {
+        let request_id = self.submit(prompt, sampling)?;
+        let mut output = String::new();
+        let mut chunks = 0usize;
+        loop {
+            let reply = self.recv_reply_for(request_id)?;
+            if !reply.incremental_output.is_empty() {
+                output.push_str(&reply.incremental_output);
+                chunks += 1;
+            }
+            if reply.finished {
+                break;
+            }
+        }
+        Ok((output, chunks))
+    }
+
+    fn stream<F>(&mut self, prompt: String, sampling: SamplingParams, mut on_delta: F) -> Result<()>
+    where
+        F: FnMut(String) -> Result<()>,
+    {
+        let request_id = self.submit(prompt, sampling)?;
+        loop {
+            let reply = self.recv_reply_for(request_id)?;
+            on_delta(reply.incremental_output)?;
+            if reply.finished {
+                return Ok(());
+            }
+        }
+    }
+
+    fn submit(&mut self, prompt: String, sampling: SamplingParams) -> Result<u64> {
+        let request_id = self.request_seq.fetch_add(1, Ordering::Relaxed);
+        let req = TokenizeRequest {
+            request_id,
+            prompt: PromptPayload::Text(prompt),
+            sampling_params: sampling,
+        };
+        let batch = FrontendToTokenizerBatch {
+            data: vec![FrontendToTokenizerMsg::Tokenize(req)],
+        };
+        let idx = self.next_worker;
+        self.next_worker = (self.next_worker + 1) % self.tokenizer_workers;
+        let target = frontend_to_tokenizer_path(&self.namespace, idx);
+        let bytes = serde_json::to_vec(&batch).context("failed serializing frontend request")?;
+        self.send_socket
+            .send_to(&bytes, &target)
+            .with_context(|| format!("failed sending frontend request to {}", target.display()))?;
+        Ok(request_id)
+    }
+
+    fn recv_reply_for(&self, request_id: u64) -> Result<crate::ipc::UserReply> {
+        let mut buffer = vec![0u8; 2 * 1024 * 1024];
+        loop {
+            let size = self
+                .recv_socket
+                .recv(&mut buffer)
+                .context("failed receiving frontend reply datagram")?;
+            if size == 0 {
+                continue;
+            }
+            let batch = serde_json::from_slice::<TokenizerToFrontendBatch>(&buffer[..size])
+                .context("failed deserializing frontend reply datagram")?;
+            for msg in batch.data {
+                let TokenizerToFrontendMsg::Reply(reply) = msg;
+                if reply.request_id == request_id {
+                    return Ok(reply);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WorkerFrontendClient {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.recv_path);
+    }
 }

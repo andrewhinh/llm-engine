@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow, ensure};
 use candle_core::{DType, Tensor};
 
@@ -5,7 +7,9 @@ use crate::core::Sequence;
 use crate::models::layers::context::FlashInferRuntimeMetadata;
 use crate::models::{Comm, KvCache, Qwen3ForCausalLM, RuntimeContext, reset_context, set_context};
 use crate::runner::Sampler;
-use crate::utils::{DecodeExecutionPlan, DecodeGraphRuntime};
+#[cfg(feature = "cuda-graph")]
+use crate::utils::DecodeCudaGraph;
+use crate::utils::{DecodeExecutionPlan, DecodeGraphCaptures, DecodeGraphRuntime};
 
 #[derive(Debug)]
 pub struct ModelRunner {
@@ -15,6 +19,8 @@ pub struct ModelRunner {
     block_size: usize,
     comm: Comm,
     graph_runtime: DecodeGraphRuntime,
+    graph_captures: DecodeGraphCaptures,
+    graph_buffers: HashMap<usize, DecodeGraphCaptureState>,
 }
 
 #[derive(Debug)]
@@ -22,6 +28,30 @@ struct PreparedBatch {
     input_ids: Tensor,
     positions: Tensor,
     slot_mapping: Option<Vec<i32>>,
+    decode_meta: Option<DecodeBatchMeta>,
+}
+
+#[derive(Debug)]
+struct DecodeBatchMeta {
+    slot_mapping: Vec<i32>,
+    slot_mapping_tensor: Tensor,
+    context_lens_tensor: Tensor,
+    block_tables_tensor: Tensor,
+    flashinfer: Option<FlashInferRuntimeMetadata>,
+}
+
+#[derive(Debug)]
+struct DecodeGraphCaptureState {
+    capture_batch: usize,
+    input_ids: Tensor,
+    positions: Tensor,
+    slot_mapping: Vec<i32>,
+    slot_mapping_tensor: Tensor,
+    context_lens_tensor: Tensor,
+    block_tables_tensor: Tensor,
+    output: Tensor,
+    #[cfg(feature = "cuda-graph")]
+    graph: DecodeCudaGraph,
 }
 
 impl ModelRunner {
@@ -48,7 +78,9 @@ impl ModelRunner {
             DType::F32,
             model.device(),
         )?;
-        let graph_runtime = DecodeGraphRuntime::new(max_num_seqs, enforce_eager, false);
+        let cuda_supported =
+            cfg!(feature = "cuda-graph") && matches!(model.device(), candle_core::Device::Cuda(_));
+        let graph_runtime = DecodeGraphRuntime::new(max_num_seqs, enforce_eager, cuda_supported);
         Ok(Self {
             model,
             sampler,
@@ -56,6 +88,8 @@ impl ModelRunner {
             block_size,
             comm,
             graph_runtime,
+            graph_captures: DecodeGraphCaptures::new(),
+            graph_buffers: HashMap::new(),
         })
     }
 
@@ -91,6 +125,10 @@ impl ModelRunner {
         &self.graph_runtime
     }
 
+    pub fn graph_captures(&self) -> Vec<usize> {
+        self.graph_captures.captured_batches()
+    }
+
     fn run_model_with_plan(
         &mut self,
         prepared: &PreparedBatch,
@@ -103,13 +141,192 @@ impl ModelRunner {
                 prepared.slot_mapping.as_deref(),
                 Some(&mut self.kv_cache),
             ),
-            DecodeExecutionPlan::GraphReplay { .. } => self.model.forward_logits(
+            DecodeExecutionPlan::GraphReplay { capture_batch } => {
+                self.run_decode_graph(capture_batch, prepared)
+            }
+        }
+    }
+
+    fn run_decode_graph(
+        &mut self,
+        capture_batch: usize,
+        prepared: &PreparedBatch,
+    ) -> Result<Tensor> {
+        if !self.can_use_decode_graph(prepared) {
+            return self.model.forward_logits(
                 &prepared.input_ids,
                 &prepared.positions,
                 prepared.slot_mapping.as_deref(),
                 Some(&mut self.kv_cache),
-            ),
+            );
         }
+        let decode_batch = prepared.input_ids.dims1()?;
+        ensure!(
+            decode_batch > 0,
+            "decode graph replay requires non-empty batch"
+        );
+        ensure!(
+            decode_batch <= capture_batch,
+            "decode batch {} exceeds capture batch {}",
+            decode_batch,
+            capture_batch
+        );
+        if !self.graph_captures.is_captured(capture_batch) {
+            self.capture_decode_graph(capture_batch, prepared)?;
+        }
+        self.replay_decode_graph(capture_batch, prepared)
+    }
+
+    fn capture_decode_graph(
+        &mut self,
+        capture_batch: usize,
+        prepared: &PreparedBatch,
+    ) -> Result<()> {
+        let decode_batch = prepared.input_ids.dims1()?;
+        ensure!(
+            decode_batch <= capture_batch,
+            "cannot capture graph for batch {} with decode batch {}",
+            capture_batch,
+            decode_batch
+        );
+        let meta = prepared
+            .decode_meta
+            .as_ref()
+            .ok_or_else(|| anyhow!("decode graph capture requires decode metadata"))?;
+        let max_blocks = meta.block_tables_tensor.dims2()?.1;
+
+        let input_ids_cpu = prepared.input_ids.to_device(&candle_core::Device::Cpu)?;
+        let positions_cpu = prepared.positions.to_device(&candle_core::Device::Cpu)?;
+        let slot_cpu = meta
+            .slot_mapping_tensor
+            .to_device(&candle_core::Device::Cpu)?;
+        let context_cpu = meta
+            .context_lens_tensor
+            .to_device(&candle_core::Device::Cpu)?;
+        let block_cpu = meta
+            .block_tables_tensor
+            .to_device(&candle_core::Device::Cpu)?;
+
+        let mut capture_input_ids = input_ids_cpu.to_vec1::<u32>()?;
+        capture_input_ids.resize(capture_batch, 0);
+        let mut capture_positions = positions_cpu.to_vec1::<u32>()?;
+        capture_positions.resize(capture_batch, 0);
+        let mut capture_slot_mapping = slot_cpu.to_vec1::<i32>()?;
+        capture_slot_mapping.resize(capture_batch, 0);
+        let mut capture_context_lens = context_cpu.to_vec1::<u32>()?;
+        capture_context_lens.resize(capture_batch, 0);
+        let mut capture_block_tables = block_cpu.to_vec2::<u32>()?;
+        capture_block_tables.resize(capture_batch, vec![0u32; max_blocks]);
+        for row in &mut capture_block_tables {
+            row.resize(max_blocks, 0);
+        }
+        let capture_block_tables_flat = capture_block_tables
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect::<Vec<_>>();
+
+        let device = prepared.input_ids.device();
+        let input_ids = Tensor::from_vec(capture_input_ids, (capture_batch,), device)?;
+        let positions = Tensor::from_vec(capture_positions, (capture_batch,), device)?;
+        let slot_mapping_tensor =
+            Tensor::from_vec(capture_slot_mapping.clone(), (capture_batch,), device)?;
+        let context_lens_tensor = Tensor::from_vec(capture_context_lens, (capture_batch,), device)?;
+        let block_tables_tensor = Tensor::from_vec(
+            capture_block_tables_flat,
+            (capture_batch, max_blocks),
+            device,
+        )?;
+
+        set_context(RuntimeContext {
+            is_prefill: false,
+            cu_seqlens_q: None,
+            cu_seqlens_k: None,
+            max_seqlen_q: 0,
+            max_seqlen_k: 0,
+            slot_mapping: Some(slot_mapping_tensor.clone()),
+            context_lens: Some(context_lens_tensor.clone()),
+            block_tables: Some(block_tables_tensor.clone()),
+            block_size: self.block_size,
+            flashinfer: None,
+        });
+        #[cfg(feature = "cuda-graph")]
+        DecodeCudaGraph::begin_capture(self.model.device())?;
+        let output = self.model.forward_logits(
+            &input_ids,
+            &positions,
+            Some(capture_slot_mapping.as_slice()),
+            Some(&mut self.kv_cache),
+        )?;
+        #[cfg(feature = "cuda-graph")]
+        let graph = DecodeCudaGraph::end_capture(self.model.device())?;
+
+        self.graph_buffers.insert(
+            capture_batch,
+            DecodeGraphCaptureState {
+                capture_batch,
+                input_ids,
+                positions,
+                slot_mapping: capture_slot_mapping,
+                slot_mapping_tensor,
+                context_lens_tensor,
+                block_tables_tensor,
+                output,
+                #[cfg(feature = "cuda-graph")]
+                graph,
+            },
+        );
+        self.graph_captures.mark_captured(capture_batch);
+        Ok(())
+    }
+
+    fn replay_decode_graph(
+        &mut self,
+        capture_batch: usize,
+        prepared: &PreparedBatch,
+    ) -> Result<Tensor> {
+        let state = self
+            .graph_buffers
+            .get_mut(&capture_batch)
+            .ok_or_else(|| anyhow!("missing decode graph buffer for batch {}", capture_batch))?;
+        let expected = state.capture_batch;
+        ensure!(
+            state.input_ids.dims1()? == expected && state.positions.dims1()? == expected,
+            "decode graph buffer shape mismatch for capture batch {}",
+            capture_batch
+        );
+        update_decode_graph_inputs(state, prepared)?;
+        set_context(RuntimeContext {
+            is_prefill: false,
+            cu_seqlens_q: None,
+            cu_seqlens_k: None,
+            max_seqlen_q: 0,
+            max_seqlen_k: 0,
+            slot_mapping: Some(state.slot_mapping_tensor.clone()),
+            context_lens: Some(state.context_lens_tensor.clone()),
+            block_tables: Some(state.block_tables_tensor.clone()),
+            block_size: self.block_size,
+            flashinfer: None,
+        });
+        #[cfg(feature = "cuda-graph")]
+        state.graph.launch()?;
+        let decode_batch = prepared.input_ids.dims1()?;
+        Ok(state.output.narrow(0, 0, decode_batch)?)
+    }
+
+    fn can_use_decode_graph(&self, prepared: &PreparedBatch) -> bool {
+        if !cfg!(feature = "cuda-graph") {
+            return false;
+        }
+        if !self.graph_runtime.is_enabled() {
+            return false;
+        }
+        if !matches!(self.model.device(), candle_core::Device::Cuda(_)) {
+            return false;
+        }
+        let Some(meta) = prepared.decode_meta.as_ref() else {
+            return false;
+        };
+        meta.flashinfer.is_none()
     }
 
     fn prepare_prefill(&self, seqs: &[&Sequence]) -> Result<PreparedBatch> {
@@ -273,6 +490,7 @@ impl ModelRunner {
             input_ids,
             positions,
             slot_mapping: use_slot_mapping.then_some(slot_mapping),
+            decode_meta: None,
         })
     }
 
@@ -322,17 +540,24 @@ impl ModelRunner {
             cu_seqlens_k: None,
             max_seqlen_q: 0,
             max_seqlen_k: 0,
-            slot_mapping: Some(slot_mapping_tensor),
-            context_lens: Some(context_lens_tensor),
-            block_tables: Some(block_tables),
+            slot_mapping: Some(slot_mapping_tensor.clone()),
+            context_lens: Some(context_lens_tensor.clone()),
+            block_tables: Some(block_tables.clone()),
             block_size: self.block_size,
-            flashinfer,
+            flashinfer: flashinfer.clone(),
         });
 
         Ok(PreparedBatch {
             input_ids,
             positions,
-            slot_mapping: Some(slot_mapping),
+            slot_mapping: Some(slot_mapping.clone()),
+            decode_meta: Some(DecodeBatchMeta {
+                slot_mapping,
+                slot_mapping_tensor,
+                context_lens_tensor,
+                block_tables_tensor: block_tables,
+                flashinfer,
+            }),
         })
     }
 
@@ -549,6 +774,83 @@ impl ModelRunner {
         }
         Ok(output)
     }
+}
+
+fn update_decode_graph_inputs(
+    state: &mut DecodeGraphCaptureState,
+    prepared: &PreparedBatch,
+) -> Result<()> {
+    let meta = prepared
+        .decode_meta
+        .as_ref()
+        .ok_or_else(|| anyhow!("decode metadata missing for graph replay"))?;
+    let capture_batch = state.capture_batch;
+    let decode_batch = prepared.input_ids.dims1()?;
+    ensure!(
+        decode_batch <= capture_batch,
+        "decode batch {} exceeds capture batch {}",
+        decode_batch,
+        capture_batch
+    );
+
+    let input_ids_cpu = prepared.input_ids.to_device(&candle_core::Device::Cpu)?;
+    let positions_cpu = prepared.positions.to_device(&candle_core::Device::Cpu)?;
+    let context_cpu = meta
+        .context_lens_tensor
+        .to_device(&candle_core::Device::Cpu)?;
+    let block_cpu = meta
+        .block_tables_tensor
+        .to_device(&candle_core::Device::Cpu)?;
+
+    let mut input_ids = input_ids_cpu.to_vec1::<u32>()?;
+    input_ids.resize(capture_batch, 0);
+    let mut positions = positions_cpu.to_vec1::<u32>()?;
+    positions.resize(capture_batch, 0);
+    let mut slot_mapping = meta.slot_mapping.clone();
+    slot_mapping.resize(capture_batch, 0);
+    let mut context_lens = context_cpu.to_vec1::<u32>()?;
+    context_lens.resize(capture_batch, 0);
+
+    let max_blocks = state.block_tables_tensor.dims2()?.1;
+    let mut block_rows = block_cpu.to_vec2::<u32>()?;
+    block_rows.resize(capture_batch, vec![0u32; max_blocks]);
+    for row in &mut block_rows {
+        row.resize(max_blocks, 0);
+    }
+    let block_flat = block_rows
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<Vec<_>>();
+
+    let device = state.input_ids.device();
+    let input_ids_t = Tensor::from_vec(input_ids, (capture_batch,), device)?;
+    let positions_t = Tensor::from_vec(positions, (capture_batch,), device)?;
+    let slot_t = Tensor::from_vec(slot_mapping.clone(), (capture_batch,), device)?;
+    let context_t = Tensor::from_vec(context_lens, (capture_batch,), device)?;
+    let block_t = Tensor::from_vec(block_flat, (capture_batch, max_blocks), device)?;
+
+    copy_tensor_data(&state.input_ids, &input_ids_t)?;
+    copy_tensor_data(&state.positions, &positions_t)?;
+    copy_tensor_data(&state.slot_mapping_tensor, &slot_t)?;
+    copy_tensor_data(&state.context_lens_tensor, &context_t)?;
+    copy_tensor_data(&state.block_tables_tensor, &block_t)?;
+    state.slot_mapping = slot_mapping;
+    Ok(())
+}
+
+fn copy_tensor_data(dst: &Tensor, src: &Tensor) -> Result<()> {
+    ensure!(
+        dst.shape().elem_count() == src.shape().elem_count(),
+        "tensor copy element count mismatch"
+    );
+    let elem_count = dst.shape().elem_count();
+    if elem_count == 0 {
+        return Ok(());
+    }
+    let idx = Tensor::arange(0u32, elem_count as u32, dst.device())?;
+    let src_flat = src.flatten_all()?;
+    let dst_flat = dst.flatten_all()?;
+    Ok(dst_flat.scatter_set(&idx, &src_flat, 0usize)?)
 }
 
 #[cfg(feature = "flashinfer")]

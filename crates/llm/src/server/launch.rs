@@ -7,9 +7,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
 
+use crate::models::{
+    LLM_TP_BACKEND_ENV, LLM_TP_NAMESPACE_ENV, LLM_TP_NCCL_ID_ENV, LLM_TP_RANK_ENV,
+};
 use crate::scheduler::io::LLM_SCHED_NAMESPACE_ENV;
 use crate::scheduler::run_scheduler_worker;
 use crate::server::api::{ServerConfig, run_server};
+use crate::tokenizer::{run_detokenizer_worker, run_tokenizer_worker};
 
 const ROLE_ENV: &str = "LLM_PROCESS_ROLE";
 const READY_FILE_ENV: &str = "LLM_READY_FILE";
@@ -171,10 +175,14 @@ pub async fn run_worker_role(role: ProcessRole) -> Result<()> {
         role.as_env_value()
     );
     signal_ready(&role)?;
-    if let ProcessRole::Scheduler { rank } = role {
-        return run_scheduler_worker(rank).await;
+    match role {
+        ProcessRole::Scheduler { rank } => run_scheduler_worker(rank).await,
+        ProcessRole::Tokenizer { index } => {
+            tokio::task::spawn_blocking(move || run_tokenizer_worker(index)).await?
+        }
+        ProcessRole::Detokenizer => tokio::task::spawn_blocking(run_detokenizer_worker).await?,
+        _ => wait_for_shutdown_signal().await,
     }
-    wait_for_shutdown_signal().await
 }
 
 fn parse_env_or_default<T>(name: &str, default: T) -> Result<T>
@@ -217,12 +225,30 @@ fn spawn_children(config: &LaunchConfig, ack_dir: &Path) -> Result<Vec<ChildProc
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
+    let tp_backend = env::var(LLM_TP_BACKEND_ENV)
+        .unwrap_or_else(|_| "gloo".to_string())
+        .to_ascii_lowercase();
+    let nccl_id_hex: Option<String> = if config.tp_size > 1 && tp_backend == "nccl" {
+        #[cfg(feature = "nccl")]
+        {
+            Some(crate::models::layers::distributed::generate_nccl_id_hex()?)
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            return Err(anyhow!(
+                "nccl backend requested, but llm crate was built without `nccl` feature"
+            ));
+        }
+    } else {
+        None
+    };
     for role in config.planned_roles() {
         let ready_file = ack_dir.join(role.ready_file_name());
-        let child = Command::new(&exe)
-            .env(ROLE_ENV, role.as_env_value())
+        let mut cmd = Command::new(&exe);
+        cmd.env(ROLE_ENV, role.as_env_value())
             .env(READY_FILE_ENV, ready_file.as_os_str())
             .env(LLM_SCHED_NAMESPACE_ENV, sched_namespace.as_str())
+            .env(LLM_TP_NAMESPACE_ENV, sched_namespace.as_str())
             .env(MODEL_ENV, config.server.model.as_str())
             .env(HOST_ENV, config.server.host.as_str())
             .env(PORT_ENV, config.server.port.to_string())
@@ -230,7 +256,14 @@ fn spawn_children(config: &LaunchConfig, ack_dir: &Path) -> Result<Vec<ChildProc
             .env(TOKENIZER_WORKERS_ENV, config.tokenizer_workers.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if let Some(nccl_id_hex) = nccl_id_hex.as_deref() {
+            cmd.env(LLM_TP_NCCL_ID_ENV, nccl_id_hex);
+        }
+        if let ProcessRole::Scheduler { rank } = role {
+            cmd.env(LLM_TP_RANK_ENV, rank.to_string());
+        }
+        let child = cmd
             .spawn()
             .with_context(|| format!("failed spawning child role {}", role.as_env_value()))?;
         children.push(ChildProcess {

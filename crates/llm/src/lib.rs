@@ -21,5 +21,6 @@ pub use scheduler::{SchedulerIo, SchedulerIoConfig, SchedulerWorker, run_schedul
 pub use server::{LaunchConfig, ProcessRole};
 pub use tokenizer::{
     BridgeOutputBatches, DetokenizeManager, TokenizeManager, TokenizerWorkerBridge,
+    frontend_reply_path, frontend_to_tokenizer_path, run_detokenizer_worker, run_tokenizer_worker,
 };
 pub use utils::{EngineConfig, SamplingParams};
