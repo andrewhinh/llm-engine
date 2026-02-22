@@ -215,14 +215,13 @@ fn plan_step_processing(
     if let Some(step) = pending_step {
         ready.push(step);
     }
-    if overlap_enabled {
-        (ready, ongoing_step)
-    } else {
+    if !overlap_enabled {
         if let Some(step) = ongoing_step {
             ready.push(step);
         }
-        (ready, None)
+        return (ready, None);
     }
+    (ready, ongoing_step)
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {

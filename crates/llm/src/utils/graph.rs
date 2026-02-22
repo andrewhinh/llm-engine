@@ -34,7 +34,7 @@ impl DecodeGraphRuntime {
         if !self.enabled || decode_batch == 0 {
             return None;
         }
-        self.batches.iter().copied().find(|bs| *bs >= decode_batch)
+        self.batches.iter().copied().find(|&bs| bs >= decode_batch)
     }
 
     pub fn plan(&self, is_prefill: bool, batch: usize) -> DecodeExecutionPlan {

@@ -40,11 +40,7 @@ pub fn token_chunk(
         choices: vec![ChatChoiceChunk {
             index: 0,
             delta: Delta {
-                role: if include_role {
-                    Some("assistant")
-                } else {
-                    None
-                },
+                role: include_role.then_some("assistant"),
                 content: Some(content),
             },
             finish_reason: None,

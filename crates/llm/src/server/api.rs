@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -317,18 +317,27 @@ fn stream_chat_completion(
 }
 
 impl ServerBackend {
+    fn lock_llm<'a>(llm: &'a Mutex<LLM>) -> Result<MutexGuard<'a, LLM>> {
+        llm.lock()
+            .map_err(|_| anyhow!("failed to acquire llm lock"))
+    }
+
+    fn lock_client<'a>(
+        client: &'a Mutex<WorkerFrontendClient>,
+    ) -> Result<MutexGuard<'a, WorkerFrontendClient>> {
+        client
+            .lock()
+            .map_err(|_| anyhow!("failed to acquire worker client lock"))
+    }
+
     pub(super) fn count_prompt_tokens(&self, prompt: &str) -> Result<usize> {
         match self {
             Self::Local { llm } => {
-                let llm = llm
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                let llm = Self::lock_llm(llm)?;
                 llm.count_prompt_tokens(prompt)
             }
             Self::Worker { client } => {
-                let client = client
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                let client = Self::lock_client(client)?;
                 client.count_prompt_tokens(prompt)
             }
         }
@@ -341,9 +350,7 @@ impl ServerBackend {
     ) -> Result<(String, usize)> {
         match self {
             Self::Local { llm } => {
-                let mut llm = llm
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                let mut llm = Self::lock_llm(llm)?;
                 let prompts = vec![prompt];
                 let params = vec![sampling];
                 let mut outputs = llm.generate(&prompts, &params)?;
@@ -352,9 +359,7 @@ impl ServerBackend {
                 Ok((output.text, output.token_ids.len()))
             }
             Self::Worker { client } => {
-                let mut client = client
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                let mut client = Self::lock_client(client)?;
                 let (text, chunk_count) = client.generate_sync(prompt, sampling)?;
                 Ok((text, chunk_count))
             }
@@ -372,9 +377,7 @@ impl ServerBackend {
     {
         match self {
             Self::Local { llm } => {
-                let mut llm = llm
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                let mut llm = Self::lock_llm(llm)?;
                 let prompts = vec![prompt];
                 let params = vec![sampling];
                 let stream = llm.generate_stream(&prompts, &params)?;
@@ -388,9 +391,7 @@ impl ServerBackend {
                 Ok(())
             }
             Self::Worker { client } => {
-                let mut client = client
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                let mut client = Self::lock_client(client)?;
                 client.stream(prompt, sampling, on_delta)
             }
         }
@@ -423,28 +424,20 @@ fn normalize_prompt(prompt: Option<String>, messages: Option<&[ChatMessage]>) ->
 
 fn sampling_from_request(request: &ChatCompletionRequest) -> SamplingParams {
     let mut params = SamplingParams::default();
-    if let Some(max_tokens) = request.max_tokens {
-        params.max_tokens = max_tokens;
-    }
-    if let Some(temperature) = request.temperature {
-        params.temperature = temperature;
-    }
-    if let Some(top_k) = request.top_k {
-        params.top_k = top_k;
-    }
-    if let Some(top_p) = request.top_p {
-        params.top_p = top_p;
-    }
-    if let Some(frequency_penalty) = request.frequency_penalty {
-        params.frequency_penalty = frequency_penalty;
-    }
-    if let Some(presence_penalty) = request.presence_penalty {
-        params.presence_penalty = presence_penalty;
-    }
-    if let Some(ignore_eos) = request.ignore_eos {
-        params.ignore_eos = ignore_eos;
-    }
+    assign_if_some(&mut params.max_tokens, request.max_tokens);
+    assign_if_some(&mut params.temperature, request.temperature);
+    assign_if_some(&mut params.top_k, request.top_k);
+    assign_if_some(&mut params.top_p, request.top_p);
+    assign_if_some(&mut params.frequency_penalty, request.frequency_penalty);
+    assign_if_some(&mut params.presence_penalty, request.presence_penalty);
+    assign_if_some(&mut params.ignore_eos, request.ignore_eos);
     params
+}
+
+fn assign_if_some<T: Copy>(slot: &mut T, value: Option<T>) {
+    if let Some(value) = value {
+        *slot = value;
+    }
 }
 
 fn completion_id(created: u64) -> String {

@@ -90,7 +90,11 @@ impl BlockManager {
     }
 
     pub fn can_append(&self, seq: &Sequence) -> bool {
-        self.free_block_ids.len() >= ((seq.len() % self.block_size == 1) as usize)
+        if seq.len() % self.block_size == 1 {
+            !self.free_block_ids.is_empty()
+        } else {
+            true
+        }
     }
 
     pub fn may_append(&mut self, seq: &mut Sequence) -> Result<()> {
@@ -170,14 +174,13 @@ impl BlockManager {
     }
 
     fn required_blocks(&mut self, seq: &Sequence) -> usize {
-        if let Some(cache) = self.prefix_cache.as_mut() {
-            let prefix_match = cache.match_prefix(&seq.token_ids);
-            let matched_blocks =
-                Self::adjusted_matched_blocks(seq.token_ids.len(), self.block_size, &prefix_match);
-            seq.num_blocks().saturating_sub(matched_blocks)
-        } else {
-            seq.num_blocks()
-        }
+        let Some(cache) = self.prefix_cache.as_mut() else {
+            return seq.num_blocks();
+        };
+        let prefix_match = cache.match_prefix(&seq.token_ids);
+        let matched_blocks =
+            Self::adjusted_matched_blocks(seq.token_ids.len(), self.block_size, &prefix_match);
+        seq.num_blocks().saturating_sub(matched_blocks)
     }
 
     fn allocate_with_prefix(&mut self, seq: &mut Sequence) -> Result<()> {

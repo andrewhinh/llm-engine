@@ -53,7 +53,7 @@ impl DetokenizeManager {
                 .decode_map
                 .entry(request.request_id)
                 .or_insert_with(DecodeStatus::new);
-            if !(request.finished && request.next_token == self.eos_token_id) {
+            if !request.finished || request.next_token != self.eos_token_id {
                 status.decoded_ids.push(request.next_token);
             }
 
@@ -61,7 +61,7 @@ impl DetokenizeManager {
             let surrogate_ids = &status.decoded_ids[status.surrogate_offset..status.read_offset];
             let read_text = decode_ids(&self.tokenizer, read_ids)?;
             let surrogate_text = decode_ids(&self.tokenizer, surrogate_ids)?;
-            let mut new_text = read_text
+            let new_text = read_text
                 .strip_prefix(&surrogate_text)
                 .unwrap_or(read_text.as_str());
 
@@ -71,9 +71,9 @@ impl DetokenizeManager {
                 status.read_offset = status.decoded_ids.len();
                 status.decoded_text.clone()
             } else {
-                new_text = find_printable_text(new_text);
+                let printable = find_printable_text(new_text);
                 let mut combined = status.decoded_text.clone();
-                combined.push_str(new_text);
+                combined.push_str(printable);
                 combined
             };
 

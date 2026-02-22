@@ -94,17 +94,17 @@ impl ModelRunner {
     }
 
     pub fn run(&mut self, seqs: &[&Sequence], is_prefill: bool) -> Result<Vec<u32>> {
-        let result = (|| -> Result<Vec<u32>> {
-            let prepared = if is_prefill {
-                self.prepare_prefill(seqs)?
-            } else {
-                self.prepare_decode(seqs)?
-            };
+        let result = if is_prefill {
+            self.prepare_prefill(seqs)
+        } else {
+            self.prepare_decode(seqs)
+        }
+        .and_then(|prepared| {
             let decode_batch = prepared.input_ids.dims1()?;
             let exec_plan = self.graph_runtime.plan(is_prefill, decode_batch);
             let logits = self.run_model_with_plan(&prepared, exec_plan)?;
             self.sample(&logits, seqs)
-        })();
+        });
         reset_context();
         result
     }
@@ -314,19 +314,13 @@ impl ModelRunner {
     }
 
     fn can_use_decode_graph(&self, prepared: &PreparedBatch) -> bool {
-        if !cfg!(feature = "cuda-graph") {
-            return false;
-        }
-        if !self.graph_runtime.is_enabled() {
-            return false;
-        }
-        if !matches!(self.model.device(), candle_core::Device::Cuda(_)) {
-            return false;
-        }
-        let Some(meta) = prepared.decode_meta.as_ref() else {
-            return false;
-        };
-        meta.flashinfer.is_none()
+        cfg!(feature = "cuda-graph")
+            && self.graph_runtime.is_enabled()
+            && matches!(self.model.device(), candle_core::Device::Cuda(_))
+            && prepared
+                .decode_meta
+                .as_ref()
+                .is_some_and(|meta| meta.flashinfer.is_none())
     }
 
     fn prepare_prefill(&self, seqs: &[&Sequence]) -> Result<PreparedBatch> {

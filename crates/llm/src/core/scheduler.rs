@@ -94,21 +94,14 @@ impl Scheduler {
     }
 
     pub fn cancel(&mut self, seq_id: usize) -> bool {
-        if let Some(pos) = self.waiting.iter().position(|seq| seq.id == seq_id) {
-            let mut seq = self.waiting.remove(pos).expect("waiting position exists");
-            seq.status = SequenceStatus::Finished;
-            self.block_manager.deallocate(&mut seq);
-            return true;
-        }
-
-        if let Some(pos) = self.running.iter().position(|seq| seq.id == seq_id) {
-            let mut seq = self.running.remove(pos).expect("running position exists");
-            seq.status = SequenceStatus::Finished;
-            self.block_manager.deallocate(&mut seq);
-            return true;
-        }
-
-        false
+        let removed = Self::remove_sequence(&mut self.waiting, seq_id)
+            .or_else(|| Self::remove_sequence(&mut self.running, seq_id));
+        let Some(mut seq) = removed else {
+            return false;
+        };
+        seq.status = SequenceStatus::Finished;
+        self.block_manager.deallocate(&mut seq);
+        true
     }
 
     pub fn schedule(&mut self) -> Result<(Vec<usize>, bool)> {
@@ -162,27 +155,18 @@ impl Scheduler {
         }
 
         let mut scheduled_decode = Vec::new();
-        while !self.running.is_empty() && num_seqs < self.max_num_seqs {
-            let mut current = Some(self.running.pop_front().expect("running is not empty"));
-            let mut preempted_current = false;
-            while !self
-                .block_manager
-                .can_append(current.as_ref().expect("current is set"))
-            {
+        'decode: while !self.running.is_empty() && num_seqs < self.max_num_seqs {
+            let Some(mut seq) = self.running.pop_front() else {
+                break;
+            };
+            while !self.block_manager.can_append(&seq) {
                 if let Some(preempt_seq) = self.running.pop_back() {
                     self.preempt(preempt_seq);
-                } else {
-                    self.preempt(current.take().expect("current is set"));
-                    preempted_current = true;
-                    break;
+                    continue;
                 }
+                self.preempt(seq);
+                continue 'decode;
             }
-
-            if preempted_current {
-                continue;
-            }
-
-            let mut seq = current.expect("current is set");
             self.block_manager.may_append(&mut seq)?;
             scheduled_ids.push(seq.id);
             scheduled_decode.push(seq);
@@ -221,22 +205,7 @@ impl Scheduler {
                 .ok_or_else(|| anyhow!("running sequence {} not found", seq_id))?;
 
             if is_prefill {
-                let consumed_prefill_tokens = if seq.prefill_chunk_tokens > 0 {
-                    seq.prefill_chunk_tokens.min(seq.remaining_prefill_tokens())
-                } else {
-                    seq.remaining_prefill_tokens()
-                };
-                ensure!(
-                    consumed_prefill_tokens > 0,
-                    "prefill postprocess requires positive consumed tokens"
-                );
-                seq.num_cached_tokens = seq
-                    .num_cached_tokens
-                    .saturating_add(consumed_prefill_tokens)
-                    .min(seq.len());
-                seq.clear_prefill_chunk_tokens();
-
-                if seq.num_cached_tokens < seq.len() {
+                if Self::update_prefill_progress(seq)? {
                     seq.status = SequenceStatus::Waiting;
                     requeue_ids.push(seq.id);
                     continue;
@@ -248,21 +217,12 @@ impl Scheduler {
             seq.append_token(token_id);
             let reached_eos = !seq.sampling_params.ignore_eos && token_id == self.eos_token_id;
             let reached_max = seq.num_completion_tokens() == seq.sampling_params.max_tokens;
-            if reached_eos || reached_max {
+            let finished = reached_eos || reached_max;
+            if finished {
                 seq.status = SequenceStatus::Finished;
                 finished_ids.push(seq.id);
-                emitted_tokens.push(PostprocessToken {
-                    seq_id: seq.id,
-                    token_id,
-                    finished: true,
-                });
-            } else {
-                emitted_tokens.push(PostprocessToken {
-                    seq_id: seq.id,
-                    token_id,
-                    finished: false,
-                });
             }
+            emitted_tokens.push(Self::postprocess_token(seq.id, token_id, finished));
         }
 
         if finished_ids.is_empty() && requeue_ids.is_empty() {
@@ -272,6 +232,49 @@ impl Scheduler {
             });
         }
 
+        let finished = self.drain_finished_and_requeue(&finished_ids, &requeue_ids);
+        Ok(PostprocessOutput {
+            tokens: emitted_tokens,
+            finished,
+        })
+    }
+
+    fn remove_sequence(queue: &mut VecDeque<Sequence>, seq_id: usize) -> Option<Sequence> {
+        let pos = queue.iter().position(|seq| seq.id == seq_id)?;
+        queue.remove(pos)
+    }
+
+    fn update_prefill_progress(seq: &mut Sequence) -> Result<bool> {
+        let consumed_prefill_tokens = if seq.prefill_chunk_tokens > 0 {
+            seq.prefill_chunk_tokens.min(seq.remaining_prefill_tokens())
+        } else {
+            seq.remaining_prefill_tokens()
+        };
+        ensure!(
+            consumed_prefill_tokens > 0,
+            "prefill postprocess requires positive consumed tokens"
+        );
+        seq.num_cached_tokens = seq
+            .num_cached_tokens
+            .saturating_add(consumed_prefill_tokens)
+            .min(seq.len());
+        seq.clear_prefill_chunk_tokens();
+        Ok(seq.num_cached_tokens < seq.len())
+    }
+
+    fn postprocess_token(seq_id: usize, token_id: u32, finished: bool) -> PostprocessToken {
+        PostprocessToken {
+            seq_id,
+            token_id,
+            finished,
+        }
+    }
+
+    fn drain_finished_and_requeue(
+        &mut self,
+        finished_ids: &[usize],
+        requeue_ids: &[usize],
+    ) -> Vec<(usize, Vec<u32>)> {
         let finished_set: HashSet<usize> = finished_ids.iter().copied().collect();
         let requeue_set: HashSet<usize> = requeue_ids.iter().copied().collect();
         let mut finished = Vec::new();
@@ -288,10 +291,7 @@ impl Scheduler {
             }
         }
         self.running = kept;
-        Ok(PostprocessOutput {
-            tokens: emitted_tokens,
-            finished,
-        })
+        finished
     }
 
     fn preempt(&mut self, mut seq: Sequence) {

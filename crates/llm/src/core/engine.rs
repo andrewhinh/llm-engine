@@ -339,7 +339,7 @@ impl Engine {
         ensure!(!prompts.is_empty(), "prompts must not be empty");
         let params = expand_sampling_params(prompts.len(), sampling_params)?;
         for (prompt, params) in prompts.iter().zip(params.into_iter()) {
-            let _ = self.add_request(PromptInput::Text(prompt), params)?;
+            self.add_request(PromptInput::Text(prompt), params)?;
         }
         Ok(EngineStream {
             engine: self,

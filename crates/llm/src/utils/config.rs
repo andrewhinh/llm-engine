@@ -255,14 +255,14 @@ pub fn parse_attention_backend(raw: &str) -> Result<AttentionBackendSelection> {
         );
         let prefill = parse_attention_backend_kind(prefill_raw)?;
         let decode = parse_attention_backend_kind(decode_raw)?;
-        return Ok(AttentionBackendSelection { prefill, decode });
+        Ok(AttentionBackendSelection { prefill, decode })
+    } else {
+        let backend = parse_attention_backend_kind(&normalized)?;
+        Ok(AttentionBackendSelection {
+            prefill: backend,
+            decode: backend,
+        })
     }
-
-    let backend = parse_attention_backend_kind(&normalized)?;
-    Ok(AttentionBackendSelection {
-        prefill: backend,
-        decode: backend,
-    })
 }
 
 fn parse_attention_backend_kind(raw: &str) -> Result<AttentionBackendKind> {

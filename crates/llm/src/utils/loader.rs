@@ -60,26 +60,26 @@ fn resolve_weight_files(model_dir: &Path) -> Result<Vec<PathBuf>> {
                 file.display()
             );
         }
-        return Ok(files);
-    }
-
-    let mut files = Vec::new();
-    for entry in fs::read_dir(model_dir)
-        .with_context(|| format!("failed listing model dir {}", model_dir.display()))?
-    {
-        let entry = entry.with_context(|| "failed reading model dir entry")?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "safetensors") {
-            files.push(path);
+        Ok(files)
+    } else {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(model_dir)
+            .with_context(|| format!("failed listing model dir {}", model_dir.display()))?
+        {
+            let entry = entry.with_context(|| "failed reading model dir entry")?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "safetensors") {
+                files.push(path);
+            }
         }
+        files.sort();
+        ensure!(
+            !files.is_empty(),
+            "no .safetensors files found under {}",
+            model_dir.display()
+        );
+        Ok(files)
     }
-    files.sort();
-    ensure!(
-        !files.is_empty(),
-        "no .safetensors files found under {}",
-        model_dir.display()
-    );
-    Ok(files)
 }
 
 fn map_packed_weight_name(name: &str) -> Option<(String, PackedShard)> {

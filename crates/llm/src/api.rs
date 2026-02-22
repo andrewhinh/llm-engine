@@ -100,9 +100,14 @@ impl LLM {
 }
 
 fn chat_messages_to_prompt(messages: &[ChatMessage]) -> String {
-    messages
-        .iter()
-        .map(|message| format!("{}: {}", message.role, message.content))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut prompt = String::new();
+    for (idx, message) in messages.iter().enumerate() {
+        if idx > 0 {
+            prompt.push('\n');
+        }
+        prompt.push_str(&message.role);
+        prompt.push_str(": ");
+        prompt.push_str(&message.content);
+    }
+    prompt
 }

@@ -38,14 +38,11 @@ pub enum ProcessRole {
 
 impl ProcessRole {
     pub fn parse(raw: &str) -> Result<Self> {
-        if raw == "launcher" {
-            return Ok(Self::Launcher);
-        }
-        if raw == "frontend" {
-            return Ok(Self::Frontend);
-        }
-        if raw == "detokenizer" {
-            return Ok(Self::Detokenizer);
+        match raw {
+            "launcher" => return Ok(Self::Launcher),
+            "frontend" => return Ok(Self::Frontend),
+            "detokenizer" => return Ok(Self::Detokenizer),
+            _ => {}
         }
         if let Some(raw_index) = raw.strip_prefix("tokenizer:") {
             let index = raw_index
@@ -123,12 +120,8 @@ impl LaunchConfig {
         let mut roles = Vec::with_capacity(2 + self.tokenizer_workers + self.tp_size);
         roles.push(ProcessRole::Frontend);
         roles.push(ProcessRole::Detokenizer);
-        for index in 0..self.tokenizer_workers {
-            roles.push(ProcessRole::Tokenizer { index });
-        }
-        for rank in 0..self.tp_size {
-            roles.push(ProcessRole::Scheduler { rank });
-        }
+        roles.extend((0..self.tokenizer_workers).map(|index| ProcessRole::Tokenizer { index }));
+        roles.extend((0..self.tp_size).map(|rank| ProcessRole::Scheduler { rank }));
         roles
     }
 }
@@ -155,8 +148,7 @@ pub async fn run_launcher(config: LaunchConfig) -> Result<()> {
         .iter()
         .map(|child| child.ready_file.clone())
         .collect::<Vec<_>>();
-    let wait_result = wait_for_ready_files(&ready_files, config.startup_timeout);
-    if let Err(err) = wait_result {
+    if let Err(err) = wait_for_ready_files(&ready_files, config.startup_timeout) {
         shutdown_children(&mut children, config.shutdown_timeout)?;
         return Err(err);
     }

@@ -89,14 +89,14 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
 pub fn load_tokenizer_config(model_dir: &Path) -> Result<Option<TokenizerConfig>> {
     let path = model_dir.join("tokenizer_config.json");
     if !path.exists() {
-        return Ok(None);
+        Ok(None)
+    } else {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed reading tokenizer config at {}", path.display()))?;
+        let config: TokenizerConfig = serde_json::from_str(&raw)
+            .with_context(|| format!("failed parsing tokenizer config at {}", path.display()))?;
+        Ok(Some(config))
     }
-
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed reading tokenizer config at {}", path.display()))?;
-    let config: TokenizerConfig = serde_json::from_str(&raw)
-        .with_context(|| format!("failed parsing tokenizer config at {}", path.display()))?;
-    Ok(Some(config))
 }
 
 pub fn resolve_eos_id(
@@ -108,14 +108,14 @@ pub fn resolve_eos_id(
         && let Some(token) = &config.eos_token
         && let Some(token_id) = tokenizer.token_to_id(token.content())
     {
-        return Ok(i64::from(token_id));
+        Ok(i64::from(token_id))
+    } else {
+        ensure!(
+            fallback_eos >= 0,
+            "unable to resolve eos token from tokenizer config and fallback eos is invalid"
+        );
+        Ok(fallback_eos)
     }
-
-    ensure!(
-        fallback_eos >= 0,
-        "unable to resolve eos token from tokenizer config and fallback eos is invalid"
-    );
-    Ok(fallback_eos)
 }
 
 pub fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {

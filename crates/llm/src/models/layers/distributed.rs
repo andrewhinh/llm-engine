@@ -549,9 +549,6 @@ pub fn kv_head_shard(total_num_kv_heads: usize, rank: usize, world_size: usize) 
             world_size.is_multiple_of(total_num_kv_heads),
             "world_size must be divisible by num_kv_heads when replicated"
         );
-        let ranks_per_kv_head = world_size / total_num_kv_heads;
-        let kv_rank = rank / ranks_per_kv_head;
-        let _ = kv_rank;
         Ok(1)
     }
 }

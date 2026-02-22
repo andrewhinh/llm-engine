@@ -95,29 +95,28 @@ impl TokenizerWorkerBridge {
     fn process(&mut self, allow_partial: bool) -> Result<BridgeOutputBatches> {
         let mut outputs = BridgeOutputBatches::default();
         while self.pending.len() >= self.local_bs || (allow_partial && !self.pending.is_empty()) {
-            let take = if self.pending.len() >= self.local_bs {
-                self.local_bs
-            } else {
-                self.pending.len()
-            };
+            let take = self.pending.len().min(self.local_bs);
             let mut tokenize_requests = Vec::new();
             let mut detokenize_requests = Vec::new();
             for _ in 0..take {
-                match self.pending.pop_front() {
-                    Some(PendingMsg::Tokenize(request))
+                let Some(msg) = self.pending.pop_front() else {
+                    continue;
+                };
+                match msg {
+                    PendingMsg::Tokenize(request)
                         if !self.aborted.contains(&request.request_id) =>
                     {
                         tokenize_requests.push(request);
                     }
-                    Some(PendingMsg::Detokenize(request))
+                    PendingMsg::Detokenize(request)
                         if !self.aborted.contains(&request.request_id) =>
                     {
                         detokenize_requests.push(request);
                     }
-                    Some(PendingMsg::Abort(request)) => {
+                    PendingMsg::Abort(request) => {
                         self.register_abort(request.request_id);
                     }
-                    Some(_) | None => {}
+                    _ => {}
                 }
             }
 
@@ -163,12 +162,16 @@ pub fn frontend_reply_path(namespace: &str) -> PathBuf {
     PathBuf::from("/tmp").join(format!("{namespace}-{FRONTEND_REPLY_SUFFIX}"))
 }
 
+fn model_from_env(role: &str) -> Result<String> {
+    env::var("LLM_MODEL")
+        .or_else(|_| env::var("MODEL"))
+        .map_err(|_| anyhow!("set LLM_MODEL (or MODEL) for {role}"))
+}
+
 pub fn run_tokenizer_worker(index: usize) -> Result<()> {
     let namespace = env::var(LLM_SCHED_NAMESPACE_ENV)
         .unwrap_or_else(|_| format!("llm-engine-sched-{}", std::process::id()));
-    let model = env::var("LLM_MODEL")
-        .or_else(|_| env::var("MODEL"))
-        .map_err(|_| anyhow!("set LLM_MODEL (or MODEL) for tokenizer worker"))?;
+    let model = model_from_env("tokenizer worker")?;
     let model_path = Path::new(&model);
     let tokenizer = load_tokenizer(model_path)?;
     let tokenizer_cfg = load_tokenizer_config(model_path)?;
@@ -215,9 +218,7 @@ pub fn run_tokenizer_worker(index: usize) -> Result<()> {
 pub fn run_detokenizer_worker() -> Result<()> {
     let namespace = env::var(LLM_SCHED_NAMESPACE_ENV)
         .unwrap_or_else(|_| format!("llm-engine-sched-{}", std::process::id()));
-    let model = env::var("LLM_MODEL")
-        .or_else(|_| env::var("MODEL"))
-        .map_err(|_| anyhow!("set LLM_MODEL (or MODEL) for detokenizer worker"))?;
+    let model = model_from_env("detokenizer worker")?;
     let model_path = Path::new(&model);
     let tokenizer = load_tokenizer(model_path)?;
     let tokenizer_cfg = load_tokenizer_config(model_path)?;
