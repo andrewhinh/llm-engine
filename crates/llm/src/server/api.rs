@@ -57,7 +57,7 @@ struct ServerState {
     model_id: String,
 }
 
-enum ServerBackend {
+pub(super) enum ServerBackend {
     Local {
         llm: Box<Mutex<LLM>>,
     },
@@ -66,7 +66,7 @@ enum ServerBackend {
     },
 }
 
-struct WorkerFrontendClient {
+pub(super) struct WorkerFrontendClient {
     namespace: String,
     tokenizer_workers: usize,
     next_worker: usize,
@@ -148,20 +148,24 @@ struct HealthResponse {
     status: &'static str,
 }
 
-pub async fn run_server(config: ServerConfig) -> Result<()> {
-    let backend = if should_use_worker_backend() {
-        Arc::new(ServerBackend::Worker {
+pub(super) fn build_backend(config: &ServerConfig) -> Result<Arc<ServerBackend>> {
+    if should_use_worker_backend() {
+        Ok(Arc::new(ServerBackend::Worker {
             client: Box::new(Mutex::new(WorkerFrontendClient::from_env(&config.model)?)),
-        })
+        }))
     } else {
         let engine_config = EngineConfig {
             model: config.model.clone(),
             ..EngineConfig::default()
         };
-        Arc::new(ServerBackend::Local {
+        Ok(Arc::new(ServerBackend::Local {
             llm: Box::new(Mutex::new(LLM::new(engine_config)?)),
-        })
-    };
+        }))
+    }
+}
+
+pub async fn run_server(config: ServerConfig) -> Result<()> {
+    let backend = build_backend(&config)?;
 
     let state = ServerState {
         backend,
@@ -219,35 +223,16 @@ async fn v1_chat_completions(
         return stream_chat_completion(state, model, prompt, sampling).into_response();
     }
 
-    match tokio::task::spawn_blocking(move || -> Result<(usize, String, Vec<u32>)> {
-        match &*state.backend {
-            ServerBackend::Local { llm } => {
-                let mut llm = llm
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
-                let prompt_tokens = llm.count_prompt_tokens(&prompt)?;
-                let prompts = vec![prompt];
-                let params = vec![sampling];
-                let mut outputs = llm.generate(&prompts, &params)?;
-                ensure!(!outputs.is_empty(), "engine returned no outputs");
-                let output = outputs.remove(0);
-                Ok((prompt_tokens, output.text, output.token_ids))
-            }
-            ServerBackend::Worker { client } => {
-                let mut client = client
-                    .lock()
-                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
-                let prompt_tokens = client.count_prompt_tokens(&prompt)?;
-                let (text, chunk_count) = client.generate_sync(prompt, sampling)?;
-                Ok((prompt_tokens, text, vec![0u32; chunk_count]))
-            }
-        }
+    let backend = Arc::clone(&state.backend);
+    match tokio::task::spawn_blocking(move || -> Result<(usize, String, usize)> {
+        let prompt_tokens = backend.count_prompt_tokens(&prompt)?;
+        let (text, completion_tokens) = backend.generate_sync_text(prompt, sampling)?;
+        Ok((prompt_tokens, text, completion_tokens))
     })
     .await
     {
-        Ok(Ok((prompt_tokens, text, token_ids))) => {
+        Ok(Ok((prompt_tokens, text, completion_tokens))) => {
             let created = now_unix_secs();
-            let completion_tokens = token_ids.len();
             let response = ChatCompletionResponse {
                 id: completion_id(created),
                 object: "chat.completion",
@@ -291,92 +276,32 @@ fn stream_chat_completion(
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(128);
     let created = now_unix_secs();
     let completion_id = completion_id(created);
+    let backend = Arc::clone(&state.backend);
 
     tokio::task::spawn_blocking(move || {
         let mut sent_terminal = false;
         let mut sent_first_role = false;
 
         let result = (|| -> Result<()> {
-            match &*state.backend {
-                ServerBackend::Local { llm } => {
-                    let mut llm = llm
-                        .lock()
-                        .map_err(|_| anyhow!("failed to acquire llm lock"))?;
-                    let prompts = vec![prompt];
-                    let params = vec![sampling];
-                    let stream = llm.generate_stream(&prompts, &params)?;
-
-                    for item in stream {
-                        match item? {
-                            StreamOutput::Token { text, .. } => {
-                                let chunk = token_chunk(
-                                    &completion_id,
-                                    created,
-                                    &model,
-                                    text,
-                                    !sent_first_role,
-                                );
-                                sent_first_role = true;
-                                if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            StreamOutput::Done(_) => {
-                                let chunk = finish_chunk(&completion_id, created, &model);
-                                if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
-                                    return Ok(());
-                                }
-                                if tx.blocking_send(Ok(done_event())).is_err() {
-                                    return Ok(());
-                                }
-                                sent_terminal = true;
-                                return Ok(());
-                            }
-                            StreamOutput::Cancelled(_) => {
-                                if tx
-                                    .blocking_send(Ok(
-                                        Event::default().data("{\"error\":\"request cancelled\"}")
-                                    ))
-                                    .is_err()
-                                {
-                                    return Ok(());
-                                }
-                                if tx.blocking_send(Ok(done_event())).is_err() {
-                                    return Ok(());
-                                }
-                                sent_terminal = true;
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                ServerBackend::Worker { client } => {
-                    let mut client = client
-                        .lock()
-                        .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
-                    client.stream(prompt, sampling, |delta| {
-                        if delta.is_empty() {
-                            return Ok(());
-                        }
-                        let chunk =
-                            token_chunk(&completion_id, created, &model, delta, !sent_first_role);
-                        sent_first_role = true;
-                        if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
-                            return Ok(());
-                        }
-                        Ok(())
-                    })?;
-                    let chunk = finish_chunk(&completion_id, created, &model);
-                    if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
-                        return Ok(());
-                    }
-                    if tx.blocking_send(Ok(done_event())).is_err() {
-                        return Ok(());
-                    }
-                    sent_terminal = true;
+            backend.stream(prompt, sampling, |delta| {
+                if delta.is_empty() {
                     return Ok(());
                 }
+                let chunk = token_chunk(&completion_id, created, &model, delta, !sent_first_role);
+                sent_first_role = true;
+                if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
+                    return Ok(());
+                }
+                Ok(())
+            })?;
+            let chunk = finish_chunk(&completion_id, created, &model);
+            if tx.blocking_send(Ok(chunk_event(&chunk))).is_err() {
+                return Ok(());
             }
+            if tx.blocking_send(Ok(done_event())).is_err() {
+                return Ok(());
+            }
+            sent_terminal = true;
             Ok(())
         })();
 
@@ -389,6 +314,87 @@ fn stream_chat_completion(
     });
 
     Sse::new(ReceiverStream::new(rx))
+}
+
+impl ServerBackend {
+    pub(super) fn count_prompt_tokens(&self, prompt: &str) -> Result<usize> {
+        match self {
+            Self::Local { llm } => {
+                let llm = llm
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                llm.count_prompt_tokens(prompt)
+            }
+            Self::Worker { client } => {
+                let client = client
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                client.count_prompt_tokens(prompt)
+            }
+        }
+    }
+
+    pub(super) fn generate_sync_text(
+        &self,
+        prompt: String,
+        sampling: SamplingParams,
+    ) -> Result<(String, usize)> {
+        match self {
+            Self::Local { llm } => {
+                let mut llm = llm
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                let prompts = vec![prompt];
+                let params = vec![sampling];
+                let mut outputs = llm.generate(&prompts, &params)?;
+                ensure!(!outputs.is_empty(), "engine returned no outputs");
+                let output = outputs.remove(0);
+                Ok((output.text, output.token_ids.len()))
+            }
+            Self::Worker { client } => {
+                let mut client = client
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                let (text, chunk_count) = client.generate_sync(prompt, sampling)?;
+                Ok((text, chunk_count))
+            }
+        }
+    }
+
+    pub(super) fn stream<F>(
+        &self,
+        prompt: String,
+        sampling: SamplingParams,
+        mut on_delta: F,
+    ) -> Result<()>
+    where
+        F: FnMut(String) -> Result<()>,
+    {
+        match self {
+            Self::Local { llm } => {
+                let mut llm = llm
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire llm lock"))?;
+                let prompts = vec![prompt];
+                let params = vec![sampling];
+                let stream = llm.generate_stream(&prompts, &params)?;
+                for item in stream {
+                    match item? {
+                        StreamOutput::Token { text, .. } => on_delta(text)?,
+                        StreamOutput::Done(_) => return Ok(()),
+                        StreamOutput::Cancelled(_) => return Err(anyhow!("request cancelled")),
+                    }
+                }
+                Ok(())
+            }
+            Self::Worker { client } => {
+                let mut client = client
+                    .lock()
+                    .map_err(|_| anyhow!("failed to acquire worker client lock"))?;
+                client.stream(prompt, sampling, on_delta)
+            }
+        }
+    }
 }
 
 fn normalize_prompt(prompt: Option<String>, messages: Option<&[ChatMessage]>) -> Result<String> {

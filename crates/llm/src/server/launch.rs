@@ -13,6 +13,7 @@ use crate::models::{
 use crate::scheduler::io::LLM_SCHED_NAMESPACE_ENV;
 use crate::scheduler::run_scheduler_worker;
 use crate::server::api::{ServerConfig, run_server};
+use crate::server::shell::run_shell;
 use crate::tokenizer::{run_detokenizer_worker, run_tokenizer_worker};
 
 const ROLE_ENV: &str = "LLM_PROCESS_ROLE";
@@ -24,6 +25,7 @@ const TP_SIZE_ENV: &str = "LLM_TP_SIZE";
 const TOKENIZER_WORKERS_ENV: &str = "LLM_TOKENIZER_WORKERS";
 const STARTUP_TIMEOUT_ENV: &str = "LLM_STARTUP_TIMEOUT_SECS";
 const SHUTDOWN_TIMEOUT_ENV: &str = "LLM_SHUTDOWN_TIMEOUT_SECS";
+pub const SHELL_MODE_ENV: &str = "LLM_SHELL_MODE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessRole {
@@ -93,6 +95,7 @@ pub struct LaunchConfig {
     pub server: ServerConfig,
     pub tp_size: usize,
     pub tokenizer_workers: usize,
+    pub shell_mode: bool,
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
 }
@@ -102,6 +105,7 @@ impl LaunchConfig {
         let server = ServerConfig::from_env()?;
         let tp_size = parse_env_or_default(TP_SIZE_ENV, 1usize)?;
         let tokenizer_workers = parse_env_or_default(TOKENIZER_WORKERS_ENV, 0usize)?;
+        let shell_mode = parse_env_bool_or_default(SHELL_MODE_ENV, false)?;
         let startup_timeout_secs = parse_env_or_default(STARTUP_TIMEOUT_ENV, 20u64)?;
         let shutdown_timeout_secs = parse_env_or_default(SHUTDOWN_TIMEOUT_ENV, 5u64)?;
         ensure!(tp_size > 0, "{TP_SIZE_ENV} must be positive");
@@ -109,6 +113,7 @@ impl LaunchConfig {
             server,
             tp_size,
             tokenizer_workers,
+            shell_mode,
             startup_timeout: Duration::from_secs(startup_timeout_secs),
             shutdown_timeout: Duration::from_secs(shutdown_timeout_secs),
         })
@@ -165,7 +170,11 @@ pub async fn run_launcher(config: LaunchConfig) -> Result<()> {
 
 pub async fn run_frontend_role(server_config: ServerConfig) -> Result<()> {
     signal_ready(&ProcessRole::Frontend)?;
-    run_server(server_config).await
+    if shell_mode_from_env()? {
+        run_shell(server_config).await
+    } else {
+        run_server(server_config).await
+    }
 }
 
 pub async fn run_worker_role(role: ProcessRole) -> Result<()> {
@@ -196,6 +205,28 @@ where
             .map_err(|err| anyhow!("invalid {name} value '{raw}': {err}")),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(err) => Err(anyhow!("failed reading {name}: {err}")),
+    }
+}
+
+pub fn shell_mode_from_env() -> Result<bool> {
+    parse_env_bool_or_default(SHELL_MODE_ENV, false)
+}
+
+fn parse_env_bool_or_default(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(raw) => parse_bool_env_value(name, &raw),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(err) => Err(anyhow!("failed reading {name}: {err}")),
+    }
+}
+
+fn parse_bool_env_value(name: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!(
+            "invalid {name} value '{raw}': expected one of 1/0,true/false,yes/no,on/off"
+        )),
     }
 }
 
@@ -254,6 +285,7 @@ fn spawn_children(config: &LaunchConfig, ack_dir: &Path) -> Result<Vec<ChildProc
             .env(PORT_ENV, config.server.port.to_string())
             .env(TP_SIZE_ENV, config.tp_size.to_string())
             .env(TOKENIZER_WORKERS_ENV, config.tokenizer_workers.to_string())
+            .env(SHELL_MODE_ENV, if config.shell_mode { "1" } else { "0" })
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());

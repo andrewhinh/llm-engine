@@ -9,7 +9,7 @@ pub mod server;
 pub mod tokenizer;
 pub mod utils;
 
-pub use api::LLM;
+pub use api::{ChatMessage, LLM};
 pub use core::Engine;
 pub use core::ModelRunner;
 pub use core::Scheduler;
