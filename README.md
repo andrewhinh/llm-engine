@@ -1,6 +1,6 @@
-# sglang-rs
+# mini-sglang
 
-A minimal Rust implementation of SGLang using Candle.
+A pure Python implementation of Mini-SGLang using Cute-DSL.
 
 ![icon](./assets/icon.svg)
 
@@ -8,7 +8,7 @@ A minimal Rust implementation of SGLang using Candle.
 
 ### Installation
 
-- [rustup](https://rustup.rs)
+- [uv](https://docs.astral.sh/uv)
 - [prek](https://prek.j178.dev)
 
 ```bash
@@ -17,52 +17,63 @@ prek install
 
 ### Setup
 
-Local:
-
-- [hf cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli#standalone-installer-recommended)
-
 ```bash
-hf download Qwen/Qwen3-0.6B --local-dir ~/huggingface/Qwen3-0.6B/
-```
-
-To run on Modal:
-
-- [uv](https://docs.astral.sh/uv) for `uvx modal` (or standalone [modal](https://modal.com/docs/guide) CLI)
-
-```bash
-uvx modal setup                                                                    # one-time auth setup
-GPU_TYPE=H100 GPU_COUNT=1 uvx modal shell scripts/modal_shell.py::dev_shell --pty  # optionally specify GPU_TYPE and GPU_COUNT; then create gpu sandbox, download model, and open shell
+uv venv
+source .venv/bin/activate
+uv pip install modal==1.3.5
+modal setup
 ```
 
 ### Commands
 
+Run an interactive shell client:
+
 ```bash
-cargo run
-cargo bench
+modal run -i minisgl/shell.py
+```
+
+Serve an OpenAI-compatible API server:
+
+```bash
+modal serve minisgl/app.py
+```
+
+Run offline benchmarks:
+
+```bash
+modal run benchmark/offline/bench.py
+modal run benchmark/offline/bench_wildchat.py
+```
+
+Run online benchmarks:
+
+1. Deploy the server:
+
+```bash
+modal deploy minisgl/app.py
+```
+
+2. Run the benchmarks:
+
+```bash
+modal run benchmark/online/bench_qwen.py
+modal run benchmark/online/bench_simple.py
 ```
 
 ## Roadmap
 
-- [ ] port nano-vllm to Rust and Candle
-- [ ] OpenAI-compatible API server
-- [ ] interactive shell mode
-- [ ] hybrid attention backend selection (prefill/decode split)
-- [ ] FlashInfer decode path
-- [ ] chunked prefill
-- [ ] radix cache
-- [ ] overlap scheduling
-- [ ] tokenizer worker scaling (multi-tokenizer processes)
-- [ ] multi-model support (Llama/Qwen2/Qwen3 dense)
-- [ ] MoE backend integration
-- [ ] Qwen3-MoE support
+- [x] port mini-sglang to Modal
+  - [ ] clean up code
+  - [ ] use bcc and torch profiler for tracing
+- [ ] rewrite C/C++/Cuda in Cute-DSL
+- [ ] replace nccl with penny
+  - [ ] rewrite penny C/C++/Cuda in Cute-DSL
+- [ ] add speculative speculative decoding (SSD)
 
 ## Credit
 
-- [Inside vLLM: Anatomy of a High-Throughput LLM Inference System](https://www.aleksagordic.com/blog/vllm)
-- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
-- [vllm.rs](https://github.com/guoqingbao/vllm.rs)
 - [mini-sglang](https://github.com/sgl-project/mini-sglang)
-
-```
-
-```
+- [Cute-DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl.html), Simon Vietner's blog posts: [1](https://veitner.bearblog.dev/an-applied-introduction-to-cutedsl/)
+- [Penny](https://github.com/SzymonOzog/Penny), worklogs [1](https://szymonozog.github.io/posts/2025-09-21-Penny-worklog-1.html), [2](https://szymonozog.github.io/posts/2025-10-26-Penny-worklog-2.html), [3](https://szymonozog.github.io/posts/2025-11-11-Penny-worklog-3.html)
+- [SSD](https://github.com/tanishqkumar/ssd), [paper](https://arxiv.org/pdf/2603.03251)
+- Tristan Hume's [blog post on profiling](https://thume.ca/2023/12/02/tracing-methods/)

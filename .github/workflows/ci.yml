@@ -9,34 +9,38 @@ on:
       - main
 
 jobs:
-  rustfmt-check:
-    name: Rust format
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Ruff
+        run: uvx ruff check --output-format=github .
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout Repository
+        uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@master
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
-          toolchain: stable
-          components: rustfmt
+          enable-cache: true
 
-      - run: cargo fmt -- --check
+      - name: Install dependencies
+        run: uv pip install --system pytest modal
 
-  rust:
-    name: Rust lint
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: clippy, rust-src
-
-      - uses: Swatinem/rust-cache@v2
-
-      - run: cargo clippy -- -D warnings
-
-      - run: cargo test --workspace
+      - name: Deploy job
+        run: |
+          pytest -q tests
+          if [ -n "${MODAL_TOKEN_ID}" ] && [ -n "${MODAL_TOKEN_SECRET}" ]; then
+              modal run ci.py
+          fi
