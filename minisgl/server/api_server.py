@@ -21,6 +21,7 @@ from minisgl.message import (
     TokenizeMsg,
     UserReply,
 )
+from minisgl.message.utils import unwrap_batch_msg
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
@@ -41,14 +42,39 @@ def get_global_state() -> FrontendManager:
 
 
 def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
-    if isinstance(msg, BatchFrontendMsg):
-        result = []
-        for reply in msg.data:
-            assert isinstance(reply, UserReply)
-            result.append(reply)
-        return result
-    assert isinstance(msg, UserReply)
-    return [msg]
+    msgs = unwrap_batch_msg(msg, BatchFrontendMsg)
+    if not isinstance(msg, BatchFrontendMsg):
+        assert isinstance(msg, UserReply)
+        return [msg]
+    assert all(isinstance(reply, UserReply) for reply in msgs)
+    return [reply for reply in msgs if isinstance(reply, UserReply)]
+
+
+async def _send_request(
+    state: "FrontendManager",
+    text: str | List[Message],
+    *,
+    max_tokens: int,
+    temperature: float = 1.0,
+    top_k: int = -1,
+    top_p: float = 1.0,
+    ignore_eos: bool = False,
+) -> int:
+    uid = state.new_user()
+    await state.send_one(
+        TokenizeMsg(
+            uid=uid,
+            text=text,
+            sampling_params=SamplingParams(
+                ignore_eos=ignore_eos,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            ),
+        )
+    )
+    return uid
 
 
 class GenerateRequest(BaseModel):
@@ -77,7 +103,7 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
-    stop: List[str] = []
+    stop: List[str] = Field(default_factory=list)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
 
@@ -230,16 +256,13 @@ app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=req.prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-            ),
-        )
+    uid = await _send_request(
+        state,
+        req.prompt,
+        max_tokens=req.max_tokens,
+        ignore_eos=req.ignore_eos,
+        temperature=0.0,
+        top_k=1,
     )
 
     return StreamingResponse(
@@ -262,20 +285,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
 
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
+    uid = await _send_request(
+        state,
+        prompt,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        ignore_eos=req.ignore_eos,
     )
 
     return StreamingResponse(
@@ -299,20 +316,14 @@ async def shell_completion(req: OpenAICompletionRequest):
     assert req.messages is not None, "Shell completion only supports chat-completions"
     prompt = [msg.model_dump() for msg in req.messages]
 
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
+    uid = await _send_request(
+        state,
+        prompt,
+        max_tokens=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        ignore_eos=req.ignore_eos,
     )
 
     async def _abort():

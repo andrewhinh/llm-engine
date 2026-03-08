@@ -2,6 +2,7 @@ import random
 from pathlib import Path
 
 from minisgl.modal import MINUTES, app, image
+from minisgl.benchmark.client import resolve_server_url
 
 URL = "https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/refs/heads/main/qwen_traceA_blksz_16.jsonl"
 
@@ -53,10 +54,6 @@ async def run_online_benchmark(server_url: str):
 
 @app.local_entrypoint()
 def main(server_url: str = ""):
-    if not server_url:
-        from modal import Cls
-
-        model_server = Cls.from_name("mini-sglang", "ModelServer")
-        server_url = model_server().serve.get_web_url()
+    server_url = resolve_server_url(server_url)
 
     run_online_benchmark.remote(server_url)

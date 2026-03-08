@@ -5,3 +5,10 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
+  - repo: local
+    hooks:
+      - id: modal-ci
+        name: run modal ci tests
+        entry: uvx modal run ci.py
+        language: system
+        pass_filenames: false

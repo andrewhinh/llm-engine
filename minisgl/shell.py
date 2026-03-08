@@ -1,77 +1,8 @@
 from __future__ import annotations
 
 import sys
-from typing import List
 
 from minisgl.modal import MINUTES, app, image, resolve_model_path
-
-
-def _build_cli_args(
-    model_path: str,
-    model_source: str,
-    dtype: str,
-    tp_size: int,
-    max_running_req: int,
-    memory_ratio: float,
-    attention_backend: str,
-    moe_backend: str,
-    cache_type: str,
-    max_extend_tokens: int,
-    page_size: int,
-    server_host: str,
-    server_port: int,
-    max_seq_len_override: int | None,
-    num_page_override: int,
-    num_tokenizer: int,
-    cuda_graph_max_bs: int,
-    use_pynccl: bool,
-) -> List[str]:
-    args = [
-        "--model-path",
-        model_path,
-        "--model-source",
-        model_source,
-        "--dtype",
-        dtype,
-        "--tensor-parallel-size",
-        str(tp_size),
-        "--max-running-requests",
-        str(max_running_req),
-        "--memory-ratio",
-        str(memory_ratio),
-        "--attention-backend",
-        attention_backend,
-        "--moe-backend",
-        moe_backend,
-        "--cache-type",
-        cache_type,
-        "--max-extend-length",
-        str(max_extend_tokens),
-        "--page-size",
-        str(page_size),
-        "--host",
-        server_host,
-        "--port",
-        str(server_port),
-    ]
-
-    if max_seq_len_override is not None:
-        args.extend(["--max-seq-len-override", str(max_seq_len_override)])
-
-    if num_page_override > 0:
-        args.extend(["--num-pages", str(num_page_override)])
-
-    if num_tokenizer is not None:
-        args.extend(["--num-tokenizer", str(num_tokenizer)])
-
-    if cuda_graph_max_bs is not None and cuda_graph_max_bs > 0:
-        args.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
-
-    if not use_pynccl:
-        args.append("--disable-pynccl")
-
-    return args
-
 
 n_gpu = 1
 
@@ -105,12 +36,12 @@ def _run_api_shell(
     from modal import interact
 
     from minisgl.server.api_server import run_api_server
-    from minisgl.server.args import parse_args
+    from minisgl.server.args import build_cli_args, parse_args
     from minisgl.server.launch import start_subprocesses
 
     resolved_path = resolve_model_path(model_path)
     server_args, run_shell = parse_args(
-        _build_cli_args(
+        build_cli_args(
             model_path=resolved_path,
             model_source=model_source,
             dtype=dtype,

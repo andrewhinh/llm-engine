@@ -16,6 +16,61 @@ from minisgl.utils import UNSET, Unset, init_logger
 logger = init_logger(__name__)
 
 
+def resolve_server_url(default_server_url: str = "") -> str:
+    if default_server_url:
+        return default_server_url
+
+    from modal import Cls
+
+    model_server = Cls.from_name("mini-sglang", "ModelServer")
+    return model_server().serve.get_web_url()
+
+
+def _read_lines(file_path: str, n: int | None = None) -> list[str]:
+    with open(file_path, "r") as f:
+        lines = f.readlines()
+    if n is not None:
+        lines = lines[:n]
+    return lines
+
+
+def _build_traces(
+    file_path: str,
+    tokenizer: Any,
+    model: type[BaseModel],
+    n: int | None,
+    dummy: bool,
+    timestamp_scale: float,
+) -> List[BenchmarkTrace]:
+    class _TraceLine(BaseModel):
+        timestamp: float
+        input_length: int
+        output_length: int
+
+    objs = [model.model_validate_json(line) for line in _read_lines(file_path, n)]
+
+    if dummy:
+        prompt = generate_prompt(tokenizer, max(obj.input_length for obj in objs))
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+        def _get_prompt(obj: _TraceLine) -> str:
+            return tokenizer.decode(ids[: obj.input_length])
+    else:
+
+        def _get_prompt(obj: _TraceLine) -> str:
+            return generate_prompt(tokenizer, obj.input_length)
+
+    return [
+        BenchmarkTrace(
+            timestamp=obj.timestamp * timestamp_scale,
+            message=_get_prompt(obj),
+            input_length=obj.input_length,
+            output_length=obj.output_length,
+        )
+        for obj in objs
+    ]
+
+
 @dataclass(frozen=True)
 class BenchmarkTrace:
     timestamp: float
@@ -427,40 +482,11 @@ def read_qwen_trace(
     dummy: bool = False,
 ) -> List[BenchmarkTrace]:
     class JSONInput(BaseModel):
-        chat_id: int
-        parent_chat_id: int
         timestamp: float
         input_length: int
         output_length: int
-        type: str
-        turn: int
-        hash_ids: List[int]
 
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-        if n is not None:
-            lines = lines[:n]
-    objs = [JSONInput.model_validate_json(line) for line in lines]
-    if dummy:
-        prompt = generate_prompt(tokenizer, max(obj.input_length for obj in objs))
-        ids = tokenizer.encode(prompt, add_special_tokens=False)
-
-        def _get_prompt(obj: JSONInput) -> str:
-            return tokenizer.decode(ids[: obj.input_length])
-    else:
-
-        def _get_prompt(obj: JSONInput) -> str:
-            return generate_prompt(tokenizer, obj.input_length)
-
-    return [
-        BenchmarkTrace(
-            timestamp=obj.timestamp,
-            message=_get_prompt(obj),
-            input_length=obj.input_length,
-            output_length=obj.output_length,
-        )
-        for obj in objs
-    ]
+    return _build_traces(file_path, tokenizer, JSONInput, n, dummy, 1.0)
 
 
 def read_mooncake_trace(
@@ -470,36 +496,11 @@ def read_mooncake_trace(
     dummy: bool = False,
 ) -> List[BenchmarkTrace]:
     class JSONInput(BaseModel):
-        timestamp: int
+        timestamp: float
         input_length: int
         output_length: int
-        hash_ids: List[int]
 
-    with open(file_path, "r") as f:
-        lines = f.readlines()
-        if n is not None:
-            lines = lines[:n]
-    objs = [JSONInput.model_validate_json(line) for line in lines]
-    if dummy:
-        prompt = generate_prompt(tokenizer, max(obj.input_length for obj in objs))
-        ids = tokenizer.encode(prompt, add_special_tokens=False)
-
-        def _get_prompt(obj: JSONInput) -> str:
-            return tokenizer.decode(ids[: obj.input_length])
-    else:
-
-        def _get_prompt(obj: JSONInput) -> str:
-            return generate_prompt(tokenizer, obj.input_length)
-
-    return [
-        BenchmarkTrace(
-            timestamp=obj.timestamp / 1000,
-            message=_get_prompt(obj),
-            input_length=obj.input_length,
-            output_length=obj.output_length,
-        )
-        for obj in objs
-    ]
+    return _build_traces(file_path, tokenizer, JSONInput, n, dummy, 1 / 1000)
 
 
 def scale_traces(

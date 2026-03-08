@@ -35,12 +35,21 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install dependencies
-        run: uv pip install --system pytest modal
+      - name: Set up Python
+        run: uv python install
 
-      - name: Deploy job
+      - name: Create virtual environment
+        run: uv venv
+
+      - name: Install dependencies
+        run: uv pip install modal
+
+      - name: Run tests
         run: |
-          pytest -q tests
+          source .venv/bin/activate
           if [ -n "${MODAL_TOKEN_ID}" ] && [ -n "${MODAL_TOKEN_SECRET}" ]; then
               modal run ci.py
+          else
+              echo "MODAL_TOKEN_ID and MODAL_TOKEN_SECRET are not set"
+              exit 1
           fi

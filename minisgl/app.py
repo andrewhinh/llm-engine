@@ -1,76 +1,6 @@
-from typing import List
-
 import modal
 
 from minisgl.modal import MINUTES, app, image, resolve_model_path
-
-
-def _build_cli_args(
-    model_path: str,
-    model_source: str,
-    dtype: str,
-    tp_size: int,
-    max_running_req: int,
-    memory_ratio: float,
-    attention_backend: str,
-    moe_backend: str,
-    cache_type: str,
-    max_extend_tokens: int,
-    page_size: int,
-    server_host: str,
-    server_port: int,
-    max_seq_len_override: int | None,
-    num_page_override: int,
-    num_tokenizer: int,
-    cuda_graph_max_bs: int | None,
-    use_pynccl: bool,
-) -> List[str]:
-    args = [
-        "--model-path",
-        model_path,
-        "--model-source",
-        model_source,
-        "--dtype",
-        dtype,
-        "--tensor-parallel-size",
-        str(tp_size),
-        "--max-running-requests",
-        str(max_running_req),
-        "--memory-ratio",
-        str(memory_ratio),
-        "--attention-backend",
-        attention_backend,
-        "--moe-backend",
-        moe_backend,
-        "--cache-type",
-        cache_type,
-        "--max-extend-length",
-        str(max_extend_tokens),
-        "--page-size",
-        str(page_size),
-        "--host",
-        server_host,
-        "--port",
-        str(server_port),
-    ]
-
-    if max_seq_len_override is not None:
-        args.extend(["--max-seq-len-override", str(max_seq_len_override)])
-
-    if num_page_override > 0:
-        args.extend(["--num-pages", str(num_page_override)])
-
-    if num_tokenizer is not None:
-        args.extend(["--num-tokenizer", str(num_tokenizer)])
-
-    if cuda_graph_max_bs is not None and cuda_graph_max_bs > 0:
-        args.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
-
-    if not use_pynccl:
-        args.append("--disable-pynccl")
-
-    return args
-
 
 n_gpu = 4
 
@@ -107,7 +37,7 @@ class ModelServer:
         import minisgl.server.api_server as api_module
         from minisgl.message import BaseFrontendMsg, BaseTokenizerMsg
         from minisgl.server.api_server import FrontendManager
-        from minisgl.server.args import parse_args
+        from minisgl.server.args import build_cli_args, parse_args
         from minisgl.server.launch import start_subprocesses
         from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 
@@ -117,7 +47,7 @@ class ModelServer:
         print(f"Starting up with model={resolved_path}, tp={self.tp_size}")
 
         server_args, _ = parse_args(
-            _build_cli_args(
+            build_cli_args(
                 model_path=resolved_path,
                 model_source=self.model_source,
                 dtype=self.dtype_str,

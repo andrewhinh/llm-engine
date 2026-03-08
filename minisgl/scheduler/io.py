@@ -9,6 +9,7 @@ from minisgl.message import (
     BatchTokenizerMsg,
     DetokenizeMsg,
 )
+from minisgl.message.utils import wrap_single_or_batch_msg
 from minisgl.utils import (
     ZmqPubQueue,
     ZmqPullQueue,
@@ -139,10 +140,10 @@ class SchedulerIOMixin:
     def _reply_tokenizer_rank0(self, reply: List[DetokenizeMsg]) -> None:
         num_reply = len(reply)
         logger.debug_rank0(f"Replying to tokenizer: {num_reply} messages")
-        if num_reply == 1:
-            self._send_into_tokenizer.put(reply[0])
-        elif num_reply > 1:
-            self._send_into_tokenizer.put(BatchTokenizerMsg(data=reply))  # type: ignore
+        if num_reply:
+            self._send_into_tokenizer.put(
+                wrap_single_or_batch_msg(reply, BatchTokenizerMsg)
+            )
 
     def _reply_tokenizer_rank1(self, reply: List[DetokenizeMsg]) -> None:
         _ = reply  # do nothing for non-primary ranks

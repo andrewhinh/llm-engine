@@ -18,13 +18,12 @@ from minisgl.message import (
     UserMsg,
     UserReply,
 )
+from minisgl.message.utils import unwrap_batch_msg, wrap_single_or_batch_msg
 from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenizer
 
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
-    if isinstance(msg, BatchTokenizerMsg):
-        return msg.data
-    return [msg]
+    return unwrap_batch_msg(msg, BatchTokenizerMsg)
 
 
 @torch.inference_mode()
@@ -76,41 +75,38 @@ def tokenize_worker(
             )
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
-                batch_output = BatchFrontendMsg(
-                    data=[
+                batch_output = wrap_single_or_batch_msg(
+                    [
                         UserReply(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
-                    ]
+                    ],
+                    BatchFrontendMsg,
                 )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
                 send_frontend.put(batch_output)
 
             if len(tokenize_msg) > 0:
                 tensors = tokenize_manager.tokenize(tokenize_msg)
-                batch_output = BatchBackendMsg(
-                    data=[
+                batch_output = wrap_single_or_batch_msg(
+                    [
                         UserMsg(
                             uid=msg.uid,
                             input_ids=t,
                             sampling_params=msg.sampling_params,
                         )
                         for msg, t in zip(tokenize_msg, tensors, strict=True)
-                    ]
+                    ],
+                    BatchBackendMsg,
                 )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
                 send_backend.put(batch_output)
             if len(abort_msg) > 0:
-                batch_output = BatchBackendMsg(
-                    data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
+                batch_output = wrap_single_or_batch_msg(
+                    [AbortBackendMsg(uid=msg.uid) for msg in abort_msg],
+                    BatchBackendMsg,
                 )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
                 send_backend.put(batch_output)
     except KeyboardInterrupt:
         pass

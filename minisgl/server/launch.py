@@ -68,17 +68,21 @@ def start_subprocesses(
 
     num_tokenizers = server_args.num_tokenizer
     # DeTokenizer, only 1
+    base_tokenizer_kwargs = dict(
+        tokenizer_path=server_args.model_path,
+        backend_addr=server_args.zmq_backend_addr,
+        frontend_addr=server_args.zmq_frontend_addr,
+        local_bs=1,
+        create=server_args.tokenizer_create_addr,
+        ack_queue=ack_queue,
+    )
+
     mp.Process(
         target=tokenize_worker,
         kwargs={
-            "tokenizer_path": server_args.model_path,
+            **base_tokenizer_kwargs,
             "addr": server_args.zmq_detokenizer_addr,
-            "backend_addr": server_args.zmq_backend_addr,
-            "frontend_addr": server_args.zmq_frontend_addr,
-            "local_bs": 1,
-            "create": server_args.tokenizer_create_addr,
             "tokenizer_id": num_tokenizers,
-            "ack_queue": ack_queue,
         },
         daemon=False,
         name="minisgl-detokenizer-0",
@@ -87,14 +91,9 @@ def start_subprocesses(
         mp.Process(
             target=tokenize_worker,
             kwargs={
-                "tokenizer_path": server_args.model_path,
+                **base_tokenizer_kwargs,
                 "addr": server_args.zmq_tokenizer_addr,
-                "backend_addr": server_args.zmq_backend_addr,
-                "frontend_addr": server_args.zmq_frontend_addr,
-                "local_bs": 1,
-                "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": i,
-                "ack_queue": ack_queue,
             },
             daemon=False,
             name=f"minisgl-tokenizer-{i}",

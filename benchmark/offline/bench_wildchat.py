@@ -1,6 +1,7 @@
 import shutil
 import time
 import urllib.request
+from itertools import islice
 from pathlib import Path
 from random import seed
 
@@ -37,11 +38,9 @@ def iter_filtered_prompt_ids(tokenizer):
             if not conv:
                 continue
 
-            first_user = None
-            for turn in conv:
-                if turn.get("role") == "user":
-                    first_user = turn
-                    break
+            first_user = next(
+                (turn for turn in conv if turn.get("role") == "user"), None
+            )
             if first_user is None:
                 continue
 
@@ -98,11 +97,7 @@ def run_offline_benchmark():
 
     tokenizer = AutoTokenizer.from_pretrained(resolved_path)
 
-    prompt_token_ids = []
-    for ids in iter_filtered_prompt_ids(tokenizer):
-        prompt_token_ids.append(ids)
-        if len(prompt_token_ids) >= NUM_SEQS:
-            break
+    prompt_token_ids = list(islice(iter_filtered_prompt_ids(tokenizer), NUM_SEQS))
 
     num_reqs = len(prompt_token_ids)
     sampling_params = [

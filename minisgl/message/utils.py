@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Type
+from typing import Any, Dict, Type, TypeVar
 
 import numpy as np
 import torch
@@ -67,3 +67,20 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
             continue
         kwargs[k] = _deserialize_any(cls_map, v)
     return cls(**kwargs)
+
+
+T = TypeVar("T")
+
+
+def unwrap_batch_msg(msg: T, batch_msg_type: Type[Any]) -> list[T]:
+    """Return a flat message list from single or batch wrappers."""
+    if isinstance(msg, batch_msg_type):
+        return list(msg.data)
+    return [msg]
+
+
+def wrap_single_or_batch_msg(msgs: list[T], batch_msg_type: Type[Any]) -> T | Any:
+    """Return a single message for one element, else a batch message."""
+    if len(msgs) == 1:
+        return msgs[0]
+    return batch_msg_type(data=msgs)

@@ -267,3 +267,70 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell
+
+
+def build_cli_args(
+    model_path: str,
+    model_source: str,
+    dtype: str,
+    tp_size: int,
+    max_running_req: int,
+    memory_ratio: float,
+    attention_backend: str,
+    moe_backend: str,
+    cache_type: str,
+    max_extend_tokens: int,
+    page_size: int,
+    server_host: str,
+    server_port: int,
+    max_seq_len_override: int | None,
+    num_page_override: int,
+    num_tokenizer: int | None,
+    cuda_graph_max_bs: int | None,
+    use_pynccl: bool,
+) -> List[str]:
+    args = [
+        "--model-path",
+        model_path,
+        "--model-source",
+        model_source,
+        "--dtype",
+        dtype,
+        "--tensor-parallel-size",
+        str(tp_size),
+        "--max-running-requests",
+        str(max_running_req),
+        "--memory-ratio",
+        str(memory_ratio),
+        "--attention-backend",
+        attention_backend,
+        "--moe-backend",
+        moe_backend,
+        "--cache-type",
+        cache_type,
+        "--max-extend-length",
+        str(max_extend_tokens),
+        "--page-size",
+        str(page_size),
+        "--host",
+        server_host,
+        "--port",
+        str(server_port),
+    ]
+
+    if max_seq_len_override is not None:
+        args.extend(["--max-seq-len-override", str(max_seq_len_override)])
+
+    if num_page_override > 0:
+        args.extend(["--num-pages", str(num_page_override)])
+
+    if num_tokenizer is not None:
+        args.extend(["--num-tokenizer", str(num_tokenizer)])
+
+    if cuda_graph_max_bs is not None and cuda_graph_max_bs > 0:
+        args.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
+
+    if not use_pynccl:
+        args.append("--disable-pynccl")
+
+    return args

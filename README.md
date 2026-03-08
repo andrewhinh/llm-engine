@@ -63,7 +63,7 @@ modal run benchmark/online/bench_simple.py
 ## Roadmap
 
 - [x] port mini-sglang to Modal
-  - [ ] clean up code
+  - [x] clean up code
   - [ ] use bcc and torch profiler for tracing
 - [ ] rewrite C/C++/Cuda in Cute-DSL
 - [ ] replace nccl with penny
