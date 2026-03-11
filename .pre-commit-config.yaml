@@ -1,30 +1,14 @@
 repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.4
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
   - repo: local
     hooks:
-      - id: rustfmt
-        name: cargo fmt
-        entry: cargo fmt
+      - id: modal-ci
+        name: run modal ci tests
+        entry: uvx modal run ci.py
         language: system
-        files: (Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|rustfmt\.toml|\.cargo/|crates/|\.rs$)
-        pass_filenames: false
-
-      - id: rustfmt-check
-        name: cargo fmt -- --check
-        entry: cargo fmt -- --check
-        language: system
-        files: (Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|rustfmt\.toml|\.cargo/|crates/|\.rs$)
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy -- -D warnings
-        entry: cargo clippy -- -D warnings
-        language: system
-        files: (Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|rustfmt\.toml|\.cargo/|crates/|\.rs$)
-        pass_filenames: false
-
-      - id: cargo-test
-        name: cargo test
-        entry: cargo test
-        language: system
-        files: (Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|rustfmt\.toml|\.cargo/|crates/|\.rs$)
         pass_filenames: false
