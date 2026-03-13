@@ -5,7 +5,7 @@ from itertools import islice
 from pathlib import Path
 from random import seed
 
-from minisgl.modal import MINUTES, app, image, resolve_model_path
+from llmeng.modal import MINUTES, app, image, resolve_model_path
 
 LANGS = {"English", "Chinese"}
 
@@ -85,8 +85,8 @@ def print_len_stats(name: str, lengths: list[int]) -> None:
 def run_offline_benchmark():
     from transformers import AutoTokenizer
 
-    from minisgl.core import SamplingParams
-    from minisgl.llm import LLM
+    from llmeng.core import SamplingParams
+    from llmeng.llm import LLM
 
     seed(0)
     NUM_SEQS = 256 * 1

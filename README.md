@@ -1,4 +1,4 @@
-# mini-sglang
+# llm-engine
 
 A pure Python implementation of Mini-SGLang using Cute-DSL.
 
@@ -26,16 +26,28 @@ modal setup
 
 ### Commands
 
+For the shell and server clients, you can specify the following environment variables:
+
+- `NNODES`: number of nodes (1..4)
+- `N_GPU`: number of GPUs per node (1..8)
+- `GPU_TYPE`: GPU type
+- `RDMA`: whether to use RDMA (0 or 1)
+
+For multi-node deployment on Hopper and Blackwell chips:
+
+1. Your Modal workspace must have RDMA support.
+2. You must pass `--rdma` to the commands below.
+
 Run an interactive shell client:
 
 ```bash
-modal run -i minisgl/shell.py
+modal run -i -m llmeng.shell
 ```
 
 Serve an OpenAI-compatible API server:
 
 ```bash
-modal serve minisgl/app.py
+modal serve llmeng/server.py
 ```
 
 Run offline benchmarks:
@@ -50,7 +62,7 @@ Run online benchmarks:
 1. Deploy the server:
 
 ```bash
-modal deploy minisgl/app.py
+N_GPU=4 GPU_TYPE=h200 modal deploy llmeng/app.py
 ```
 
 2. Run the benchmarks:
@@ -63,11 +75,8 @@ modal run benchmark/online/bench_simple.py
 ## Roadmap
 
 - [x] port mini-sglang to Modal
-  - [x] clean up code
-  - [ ] use bcc and torch profiler for tracing
-- [ ] rewrite C/C++/Cuda in Cute-DSL
-- [ ] replace nccl with penny
-  - [ ] rewrite penny C/C++/Cuda in Cute-DSL
+- [x] replace nccl with penny
+- [ ] rewrite C++/CUDA/Triton in Cute-DSL
 - [ ] add speculative speculative decoding (SSD)
 
 ## Credit

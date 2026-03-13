@@ -1,10 +1,19 @@
 import random
 from pathlib import Path
 
-from minisgl.modal import MINUTES, app, image
-from minisgl.benchmark.client import resolve_server_url
+from modal import Cls
+
+from llmeng.modal import MINUTES, app, image
 
 URL = "https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/refs/heads/main/qwen_traceA_blksz_16.jsonl"
+
+
+def resolve_server_url(default_server_url: str = "") -> str:
+    if default_server_url:
+        return default_server_url
+
+    model_server = Cls.from_name("llm-engine", "ModelServer")
+    return model_server().serve.get_web_url()
 
 
 def download_qwen_trace(url: str, logger) -> str:
@@ -23,14 +32,14 @@ async def run_online_benchmark(server_url: str):
     from openai import AsyncOpenAI as OpenAI
     from transformers import AutoTokenizer
 
-    from minisgl.benchmark.client import (
+    from llmeng.benchmark.client import (
         benchmark_trace,
         get_model_name,
         process_benchmark_results,
         read_qwen_trace,
         scale_traces,
     )
-    from minisgl.utils import init_logger
+    from llmeng.utils import init_logger
 
     logger = init_logger(__name__)
     random.seed(42)

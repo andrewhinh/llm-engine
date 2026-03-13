@@ -2,11 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from minisgl.core import SamplingParams
+from llmeng.core import SamplingParams
 import torch
-from minisgl.message import BatchBackendMsg, UserMsg
-from minisgl.message.utils import serialize_type, deserialize_type
-from minisgl.utils import call_if_main, init_logger
+from llmeng.message import BatchBackendMsg, UserMsg
+from llmeng.message.utils import serialize_type, deserialize_type
+from llmeng.utils import call_if_main, init_logger
 
 logger = init_logger(__name__)
 

@@ -7,8 +7,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-import minisgl.core as core
-from minisgl.scheduler.cache import CacheManager
+import llmeng.core as core
+from llmeng.scheduler.cache import CacheManager
 
 
 @pytest.fixture(autouse=True)
