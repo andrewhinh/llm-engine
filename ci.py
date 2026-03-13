@@ -1,6 +1,6 @@
 import pathlib
 
-from minisgl.modal import app, image
+from llmeng.modal import app, image
 
 CI_IMAGE = image.add_local_dir(
     str(pathlib.Path(__file__).resolve().parent / "tests"),

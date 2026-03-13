@@ -2,8 +2,17 @@ import asyncio
 import random
 from typing import List
 
-from minisgl.app import MINUTES, app, image
-from minisgl.benchmark.client import resolve_server_url
+from modal import Cls
+
+from llmeng.modal import MINUTES, app, image
+
+
+def resolve_server_url(default_server_url: str = "") -> str:
+    if default_server_url:
+        return default_server_url
+
+    model_server = Cls.from_name("llm-engine", "ModelServer")
+    return model_server().serve.get_web_url()
 
 
 @app.function(image=image, timeout=10 * MINUTES)
@@ -11,13 +20,13 @@ async def run_online_benchmark(server_url: str):
     from openai import AsyncOpenAI as OpenAI
     from transformers import AutoTokenizer
 
-    from minisgl.benchmark.client import (
+    from llmeng.benchmark.client import (
         benchmark_one_batch,
         generate_prompt,
         get_model_name,
         process_benchmark_results,
     )
-    from minisgl.utils import init_logger
+    from llmeng.utils import init_logger
 
     logger = init_logger(__name__)
     random.seed(42)

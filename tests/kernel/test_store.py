@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from minisgl.benchmark.perf import compare_memory_kernel_perf
+from llmeng.benchmark.perf import compare_memory_kernel_perf
 import torch
-from minisgl.kernel import store_cache
-from minisgl.utils import call_if_main
+from llmeng.kernel import store_cache
+from llmeng.utils import call_if_main
 
 
 @call_if_main(__name__)

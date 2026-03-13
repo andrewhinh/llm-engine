@@ -1,7 +1,7 @@
 import time
 from random import randint, seed
 
-from minisgl.modal import MINUTES, app, image, resolve_model_path
+from llmeng.modal import MINUTES, app, image, resolve_model_path
 
 
 @app.function(
@@ -10,8 +10,8 @@ from minisgl.modal import MINUTES, app, image, resolve_model_path
     timeout=10 * MINUTES,
 )
 def run_offline_benchmark():
-    from minisgl.core import SamplingParams
-    from minisgl.llm import LLM
+    from llmeng.core import SamplingParams
+    from llmeng.llm import LLM
 
     seed(0)
     num_seqs = 256

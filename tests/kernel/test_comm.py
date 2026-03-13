@@ -1,12 +1,12 @@
 import os
 import time
+
 import torch
-from minisgl.distributed import set_tp_info
-import minisgl.kernel as kernel
 from tqdm import tqdm
 
-from minisgl.utils import init_logger
-
+import llmeng.kernel as kernel
+from llmeng.distributed import set_tp_info
+from llmeng.utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -14,7 +14,7 @@ logger = init_logger(__name__)
 @torch.no_grad()
 def run(tp_size: int, tp_rank: int):
     torch.cuda.set_device(tp_rank)
-    torch.cuda.set_stream(torch.cuda.Stream(tp_rank))  # type: ignore
+    torch.cuda.set_stream(torch.cuda.Stream(tp_rank))
     stream = torch.cuda.current_stream()
     set_tp_info(tp_rank, tp_size)
 
@@ -34,8 +34,10 @@ def run(tp_size: int, tp_rank: int):
     USE_SYMM = 0
 
     comm = kernel.init_pynccl(
-        tp_rank=tp_rank,
-        tp_size=tp_size,
+        local_rank=tp_rank,
+        local_size=tp_size,
+        global_rank=tp_rank,
+        global_size=tp_size,
         tp_cpu_group=tp_cpu_group,
         max_size_bytes=8192 * K * dtype.itemsize if USE_SYMM else 0,
     )
@@ -74,7 +76,7 @@ def run(tp_size: int, tp_rank: int):
             tic.record(cur_stream)
             if use_graph:
                 for _ in range(M):
-                    g.replay()  # type: ignore
+                    g.replay()
             else:
                 for _ in range(M):
                     for _ in pbar:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from minisgl.kernel import test_tensor as check_tensor_signature
-from minisgl.utils import call_if_main
+from llmeng.kernel import test_tensor as check_tensor_signature
+from llmeng.utils import call_if_main
 import torch
 import pytest
 
