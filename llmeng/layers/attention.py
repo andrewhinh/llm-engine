@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from llmeng.core import get_global_ctx
 from llmeng.distributed import get_tp_info
-from llmeng.utils import div_even
+from llmeng.utils import div_even, split_kv_heads
 
 from .base import StateLessOP
 from .rotary import get_rope
@@ -29,9 +30,10 @@ class AttentionLayer(StateLessOP):
         assert num_qo_heads % num_kv_heads == 0
         self.layer_id = layer_id
         self.head_dim = head_dim
-        tp_size = get_tp_info().size
+        tp_info = get_tp_info()
+        tp_size = tp_info.size
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
-        self.num_kv_heads = div_even(num_kv_heads, tp_size)
+        self.num_kv_heads, _, _ = split_kv_heads(num_kv_heads, tp_size, tp_info.rank)
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
         self.rotary = get_rope(

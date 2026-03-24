@@ -10,7 +10,7 @@ import torch
 from llmeng.core import Batch, get_global_ctx
 from llmeng.distributed import get_tp_info
 from llmeng.env import ENV
-from llmeng.utils import div_even, init_logger
+from llmeng.utils import div_even, init_logger, split_kv_heads
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -109,9 +109,12 @@ class FlashInferBackend(BaseAttnBackend):
         self.decode_wrappers._int_workspace_buffer = self.int_workspace_buffer
 
         # initialize some data members
-        tp_size = get_tp_info().size
+        tp_info = get_tp_info()
+        tp_size = tp_info.size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
-        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size)
+        self.kv_head_local, _, _ = split_kv_heads(
+            self.config.num_kv_heads, tp_size, tp_info.rank
+        )
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor(
             [], dtype=torch.int32, pin_memory=True
@@ -181,7 +184,10 @@ class FlashInferBackend(BaseAttnBackend):
         batch: Batch,
     ) -> torch.Tensor:
         def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
-            return cache.view(-1, 1, cache.shape[2], cache.shape[3])
+            return cache.as_strided(
+                (cache.shape[0] * cache.shape[1], 1, cache.shape[2], cache.shape[3]),
+                (cache.stride(1), cache.stride(1), cache.stride(2), cache.stride(3)),
+            )
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)

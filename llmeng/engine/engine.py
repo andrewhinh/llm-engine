@@ -4,9 +4,12 @@ from datetime import timedelta
 from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
+
 from llmeng.attention import create_attention_backend
 from llmeng.core import Batch, Context, Req, set_global_ctx
 from llmeng.distributed import (
+    DistributedInfo,
+    configure_torch_distributed,
     destroy_distributed,
     enable_pynccl_distributed,
     set_tp_info,
@@ -16,10 +19,11 @@ from llmeng.layers import set_rope_device
 from llmeng.models import create_model, load_weight
 from llmeng.moe import create_moe_backend
 from llmeng.utils import (
-    div_even,
+    get_device_capability,
+    has_device_capability,
     init_logger,
     is_sm90_supported,
-    is_sm100_supported,
+    split_kv_heads,
     torch_dtype,
 )
 
@@ -39,7 +43,12 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        set_tp_info(
+            rank=config.tp_info.rank,
+            size=config.tp_info.size,
+            global_rank=config.tp_info.global_rank,
+            global_size=config.tp_info.global_size,
+        )
         _adjust_config(config)
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
@@ -132,16 +141,22 @@ class Engine:
     ) -> torch.distributed.ProcessGroup:
         global_rank = config.tp_info.resolved_global_rank
         global_world_size = config.tp_info.resolved_global_size
-        if config.tp_info.size == 1 or config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=global_rank,
-                world_size=global_world_size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.group.WORLD
-            assert tp_cpu_group is not None
+        tp_ranks = _node_local_tp_ranks(config.tp_info)
+        use_pynccl_wrapper = config.tp_info.size > 1 and config.use_pynccl
+        torch.distributed.init_process_group(
+            backend="gloo" if use_pynccl_wrapper or global_world_size == 1 else "nccl",
+            rank=global_rank,
+            world_size=global_world_size,
+            timeout=timedelta(seconds=config.distributed_timeout),
+            init_method=config.distributed_addr,
+        )
+        tp_cpu_group = torch.distributed.new_group(ranks=tp_ranks, backend="gloo")
+        assert tp_cpu_group is not None
+        if config.tp_info.size == 1:
+            configure_torch_distributed(None, 1)
+            return tp_cpu_group
+        if use_pynccl_wrapper:
+            configure_torch_distributed(None, 1)
             max_bytes = (
                 config.max_forward_len
                 * config.model_config.hidden_size
@@ -149,15 +164,11 @@ class Engine:
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=global_rank,
-                world_size=global_world_size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
+            tp_device_group = torch.distributed.new_group(
+                ranks=tp_ranks, backend="nccl"
             )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
-            assert tp_cpu_group is not None
+            assert tp_device_group is not None
+            configure_torch_distributed(tp_device_group, config.tp_info.size)
         return tp_cpu_group
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
@@ -169,15 +180,22 @@ class Engine:
         else:
             return {
                 k: v.to(self.dtype)
-                for k, v in load_weight(config.model_path, self.device).items()
+                for k, v in load_weight(
+                    config.model_path, config.model_config, self.device
+                ).items()
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
+        local_kv_heads, _, _ = split_kv_heads(
+            config.model_config.num_kv_heads,
+            config.tp_info.size,
+            config.tp_info.rank,
+        )
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size)
+            * local_kv_heads
             * config.page_size
             * self.dtype.itemsize
             * config.model_config.num_layers
@@ -240,12 +258,19 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        torch.distributed.destroy_process_group()
         destroy_distributed()
+        torch.distributed.destroy_process_group()
 
 
 def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
+
+
+def _node_local_tp_ranks(tp_info: DistributedInfo) -> list[int]:
+    global_rank = tp_info.resolved_global_rank
+    local_world_size = tp_info.size
+    node_start = (global_rank // local_world_size) * local_world_size
+    return list(range(node_start, node_start + local_world_size))
 
 
 def _adjust_config(config: EngineConfig):
@@ -255,7 +280,10 @@ def _adjust_config(config: EngineConfig):
     if config.attention_backend == "auto":
         backend = (
             "trtllm"
-            if is_sm100_supported()
+            if has_device_capability(10, 0)
+            else "fi"
+            if (device_cap := get_device_capability()) is not None
+            and device_cap[0] >= 12
             else ("fa,fi" if is_sm90_supported() else "fi")
         )
         override("attention_backend", backend)
