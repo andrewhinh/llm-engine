@@ -1,7 +1,7 @@
-#include <llmeng/tensor.h>
-#include <llmeng/utils.cuh>
-#include <llmeng/utils.h>
-#include <llmeng/warp.cuh>
+#include <minisgl/tensor.h>
+#include <minisgl/utils.cuh>
+#include <minisgl/utils.h>
+#include <minisgl/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 

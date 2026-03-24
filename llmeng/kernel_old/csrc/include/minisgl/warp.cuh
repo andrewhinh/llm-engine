@@ -1,5 +1,5 @@
 #pragma once
-#include <llmeng/utils.cuh>
+#include <minisgl/utils.cuh>
 
 #include <sys/cdefs.h>
 

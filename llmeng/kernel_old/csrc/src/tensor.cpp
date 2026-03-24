@@ -1,5 +1,5 @@
-#include <llmeng/tensor.h>
-#include <llmeng/utils.h>
+#include <minisgl/tensor.h>
+#include <minisgl/utils.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/array.h>

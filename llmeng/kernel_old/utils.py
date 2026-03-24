@@ -31,7 +31,7 @@ class KernelConfig(NamedTuple):
 
 
 def _make_name(*args: str) -> str:
-    return "llmeng__" + "_".join(str(arg) for arg in args)
+    return "minisgl__" + "_".join(str(arg) for arg in args)
 
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:

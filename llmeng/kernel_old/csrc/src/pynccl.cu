@@ -1,7 +1,7 @@
-#include <llmeng/nccl227.h>
-#include <llmeng/tensor.h>
-#include <llmeng/utils.cuh>
-#include <llmeng/utils.h>
+#include <minisgl/nccl227.h>
+#include <minisgl/tensor.h>
+#include <minisgl/utils.cuh>
+#include <minisgl/utils.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/array.h>
@@ -162,7 +162,7 @@ public:
 
   auto get_buffer() const -> void * { return m_sym_mem.get(); }
 
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("llmeng.NCCLWrapper", NCCLWrapper,
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("minisgl.NCCLWrapper", NCCLWrapper,
                                     tvm::ffi::Object);
 
 private:

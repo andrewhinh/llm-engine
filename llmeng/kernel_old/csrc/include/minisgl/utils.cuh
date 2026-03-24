@@ -1,6 +1,6 @@
 #pragma once
 
-#include <llmeng/utils.h>
+#include <minisgl/utils.h>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>

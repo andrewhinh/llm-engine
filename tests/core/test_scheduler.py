@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import torch
 import multiprocessing as mp
+
+import torch
 from transformers import AutoTokenizer
 
+from llmeng.core import SamplingParams
 from llmeng.distributed import DistributedInfo
 from llmeng.message import (
     BaseBackendMsg,
@@ -13,8 +15,7 @@ from llmeng.message import (
     UserMsg,
 )
 from llmeng.scheduler import Scheduler, SchedulerConfig
-from llmeng.utils import ZmqPullQueue, ZmqPushQueue, call_if_main, init_logger
-from llmeng.core import SamplingParams
+from llmeng.utils import ZmqPullQueue, ZmqPushQueue, init_logger
 
 logger = init_logger(__name__)
 
@@ -29,7 +30,6 @@ def scheduler(config: SchedulerConfig, queue: mp.Queue) -> None:
         logger.info_rank0("Scheduler exiting...")
 
 
-@call_if_main(__name__)
 def main():
     config = SchedulerConfig(
         model_path="meta-llama/Llama-3.1-8B-Instruct",

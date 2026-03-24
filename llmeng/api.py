@@ -1,27 +1,35 @@
 import os
+from datetime import datetime, timezone
 
 import modal
 import modal.experimental
 
 from llmeng.modal import (
     GPU_TYPE,
+    HF_CACHE_PATH,
     MINUTES,
-    MODEL_DIR,
     N_GPU,
     NNODES,
     RDMA,
     app,
-    image,
-    model_volume,
+    get_runtime_image,
+    hf_cache_volume,
 )
 
 
-def _create_model_server_class(cluster_size: int):
+def create_model_server_class(
+    engine: str = "llmeng",
+    model: str = "Qwen/Qwen3-32B",
+    nnode: int = NNODES,
+    gpu_type: str = GPU_TYPE,
+    n_gpu: int = N_GPU,
+    name_suffix: str | None = None,
+):
     class _ModelServer:
-        model_path: str = modal.parameter(default="Qwen/Qwen3-14B")
+        model_path: str = modal.parameter(default=model)
         model_source: str = modal.parameter(default="huggingface")
         dtype_str: str = modal.parameter(default="auto")
-        tp_size: int = modal.parameter(default=N_GPU)
+        tp_size: int = modal.parameter(default=n_gpu)
         max_running_req: int = modal.parameter(default=256)
         memory_ratio: int = modal.parameter(default=90)
         attention_backend: str = modal.parameter(default="auto")
@@ -34,9 +42,11 @@ def _create_model_server_class(cluster_size: int):
         max_seq_len_override: int = modal.parameter(default=0)
         num_page_override: int = modal.parameter(default=0)
         num_tokenizer: int = modal.parameter(default=0)
-        cuda_graph_max_bs: int = modal.parameter(default=0)
-        use_pynccl: bool = modal.parameter(default=True)
-        nnodes: int = modal.parameter(default=cluster_size)
+        cuda_graph_max_bs: int = modal.parameter(default=-1)
+        use_nccl: bool = modal.parameter(default=True)
+        nnodes: int = modal.parameter(default=nnode)
+        server_id: str = modal.parameter(default="")
+        startup_metrics_dict_id: str = modal.parameter(default="")
 
         @modal.enter()
         def startup(self):
@@ -47,35 +57,37 @@ def _create_model_server_class(cluster_size: int):
             from llmeng.server.launch import start_subprocesses
             from llmeng.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 
-            if self.nnodes != cluster_size:
-                raise ValueError(f"Expected nnodes={cluster_size}, got {self.nnodes}.")
+            if self.server_id and self.startup_metrics_dict_id:
+                startup_metrics = modal.Dict.from_id(self.startup_metrics_dict_id)
+                startup_metrics[self.server_id] = datetime.now(timezone.utc).timestamp()
+
+            if self.nnodes != nnode:
+                raise ValueError(f"Expected nnodes={nnode}, got {self.nnodes}.")
 
             node_rank = 0
             master_ip = "127.0.0.1"
-            if cluster_size > 1:
+            if nnode > 1:
                 cluster_info = modal.experimental.get_cluster_info()
                 node_rank = cluster_info.rank
                 master_ip = cluster_info.container_ipv4_ips[0]
                 print(f"Cluster info: {cluster_info}, master_ip: {master_ip}")
 
             self.logger = init_logger(__name__, "modal-server")
-            os.environ["NNODES"] = str(cluster_size)
+            os.environ["NNODES"] = str(nnode)
             os.environ["LLMENG_NODE_RANK"] = str(node_rank)
             os.environ["LLMENG_DISTRIBUTED_ADDR"] = (
                 f"tcp://{master_ip}:{self.server_port + 1}"
             )
-            if cluster_size > 1:
-                os.environ.setdefault("NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY", "AF_INET6")
 
             resolved_path = self.model_path
             local_name = resolved_path.replace("/", "--")
-            local_path = os.path.join(MODEL_DIR, local_name)
+            local_path = os.path.join(HF_CACHE_PATH, local_name)
 
             if not os.path.exists(local_path):
                 from huggingface_hub import snapshot_download
 
                 resolved_path = snapshot_download(resolved_path, local_dir=local_path)
-                model_volume.commit()
+                hf_cache_volume.commit()
 
             self.config, _ = parse_args(
                 build_cli_args(
@@ -95,8 +107,14 @@ def _create_model_server_class(cluster_size: int):
                     max_seq_len_override=self.max_seq_len_override or None,
                     num_page_override=self.num_page_override,
                     num_tokenizer=self.num_tokenizer,
-                    cuda_graph_max_bs=self.cuda_graph_max_bs,
-                    use_pynccl=self.use_pynccl,
+                    cuda_graph_max_bs=(
+                        None
+                        if self.cuda_graph_max_bs == -1
+                        else 0
+                        if self.cuda_graph_max_bs == -2
+                        else self.cuda_graph_max_bs
+                    ),
+                    use_nccl=self.use_nccl,
                 ),
                 run_shell=False,
             )
@@ -137,32 +155,22 @@ def _create_model_server_class(cluster_size: int):
 
             self.logger.info("Server shutdown complete")
 
-    cls_name = (
-        "ModelServer" if cluster_size == 1 else f"ModelServerClustered{cluster_size}"
-    )
+    cls_name = "ModelServer" if nnode == 1 else f"ModelServerClustered{nnode}"
+    if name_suffix:
+        cls_name = f"{cls_name}{name_suffix}"
     _ModelServer.__name__ = cls_name
     _ModelServer.__qualname__ = cls_name
 
-    decorated = modal.concurrent(max_inputs=64)(_ModelServer)
-    if cluster_size > 1:
-        decorated = modal.experimental.clustered(size=cluster_size, rdma=RDMA)(
-            decorated
-        )
+    decorated = modal.concurrent(max_inputs=1000)(_ModelServer)
+    if nnode > 1:
+        decorated = modal.experimental.clustered(size=nnode, rdma=RDMA)(decorated)
     decorated = app.cls(
-        image=image,
-        gpu=f"{GPU_TYPE}:{N_GPU}",
-        timeout=60 * MINUTES,
-        scaledown_window=5 * MINUTES,
+        image=get_runtime_image(engine),
+        gpu=f"{gpu_type}:{n_gpu}",
+        startup_timeout=30 * MINUTES,
+        timeout=30 * MINUTES,
+        scaledown_window=2 * MINUTES,
         serialized=True,
     )(decorated)
+    globals()[cls_name] = decorated
     return decorated
-
-
-CLASS_NAME_BY_NNODES: dict[int, str] = {}
-MODEL_SERVER_BY_NNODES: dict[int, type] = {}
-
-_cls = _create_model_server_class(NNODES)
-_name = "ModelServer" if NNODES == 1 else f"ModelServerClustered{NNODES}"
-CLASS_NAME_BY_NNODES[NNODES] = _name
-MODEL_SERVER_BY_NNODES[NNODES] = _cls
-globals()[_name] = _cls
