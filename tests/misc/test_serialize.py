@@ -1,12 +1,14 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List
 
-from llmeng.core import SamplingParams
 import torch
+
+from llmeng.core import SamplingParams
 from llmeng.message import BatchBackendMsg, UserMsg
-from llmeng.message.utils import serialize_type, deserialize_type
-from llmeng.utils import call_if_main, init_logger
+from llmeng.message.utils import deserialize_type, serialize_type
+from llmeng.utils import init_logger
 
 logger = init_logger(__name__)
 
@@ -19,7 +21,6 @@ class A:
     w: torch.Tensor
 
 
-@call_if_main()
 def test_serialize_deserialize():
 
     t = torch.tensor([1, 2, 3], dtype=torch.int32)

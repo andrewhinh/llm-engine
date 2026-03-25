@@ -48,7 +48,7 @@ def _PARSE_MEM_BYTES(mem: str) -> int:
     return int(float(mem[:-1]) * UNIT_MAP[mem[-1]])
 
 
-MINISGL_ENV_PREFIX = "MINISGL_"
+ENV_PREFIX = "LLMENG_"
 EnvInt = partial(EnvVar[int], fn=int)
 EnvFloat = partial(EnvVar[float], fn=float)
 EnvBool = partial(EnvVar[bool], fn=_TO_BOOL)
@@ -69,7 +69,7 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     OVERLAP_EXTRA_SYNC = EnvBool(False)
-    PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
+    NCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
 
     def __new__(cls):
         # single instance
@@ -83,7 +83,7 @@ class EnvClassSingleton:
                 continue
             attr_value = getattr(self, attr_name)
             assert isinstance(attr_value, BaseEnv)
-            attr_value._init(f"{MINISGL_ENV_PREFIX}{attr_name}")
+            attr_value._init(f"{ENV_PREFIX}{attr_name}")
 
 
 ENV = EnvClassSingleton()

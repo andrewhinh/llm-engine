@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+from tqdm import tqdm
+
 from llmeng.core import Batch, Req, get_global_ctx
 from llmeng.distributed import get_tp_info
 from llmeng.utils import init_logger
-from tqdm import tqdm
 
 if TYPE_CHECKING:
     from llmeng.attention import BaseAttnBackend

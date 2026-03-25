@@ -40,11 +40,22 @@ class DistributedInfo:  # should not export from here
 _TP_INFO: DistributedInfo | None = None
 
 
-def set_tp_info(rank: int, size: int) -> None:
+def set_tp_info(
+    rank: int,
+    size: int,
+    *,
+    global_rank: int | None = None,
+    global_size: int | None = None,
+) -> None:
     global _TP_INFO
     if _TP_INFO is not None:
         raise RuntimeError("TP info has been set")
-    _TP_INFO = DistributedInfo(rank, size)
+    _TP_INFO = DistributedInfo(
+        rank,
+        size,
+        global_rank=global_rank,
+        global_size=global_size,
+    )
 
 
 def get_tp_info() -> DistributedInfo:

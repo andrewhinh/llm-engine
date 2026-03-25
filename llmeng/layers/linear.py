@@ -4,8 +4,9 @@ from typing import List
 
 import torch
 import torch.nn.functional as F
+
 from llmeng.distributed import DistributedCommunicator, get_tp_info
-from llmeng.utils import div_even
+from llmeng.utils import div_even, split_kv_heads
 
 from .base import BaseOP
 
@@ -78,13 +79,12 @@ class LinearQKVMerged(_LinearTPImpl):
         has_bias: bool,
     ):
         tp_info = get_tp_info()
-
-        GQA_ratio = div_even(num_qo_heads, num_kv_heads)
-        local_num_kv = div_even(num_kv_heads, tp_info.size)
+        local_num_qo = div_even(num_qo_heads, tp_info.size)
+        local_num_kv, _, _ = split_kv_heads(num_kv_heads, tp_info.size, tp_info.rank)
         full_isize = hidden_size
-        full_osize = (GQA_ratio + 2) * num_kv_heads * head_dim
+        full_osize = (num_qo_heads + 2 * num_kv_heads) * head_dim
         local_isize = hidden_size
-        local_osize = (GQA_ratio + 2) * local_num_kv * head_dim
+        local_osize = (local_num_qo + 2 * local_num_kv) * head_dim
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
 

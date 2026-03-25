@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Tuple
 import torch
 
 from llmeng.core import Batch, get_global_ctx
-from llmeng.utils import is_sm100_supported
+from llmeng.utils import has_device_capability
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -44,7 +44,9 @@ class FlashAttentionBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
-        self.version = 4 if is_sm100_supported() else 3
+        self.version = (
+            4 if has_device_capability(10, 0) else 3
+        )  # TODO: FA4 only on SM100, not for other SM1xx chips (i.e., rtx-pro-6000)
 
     def forward(
         self,

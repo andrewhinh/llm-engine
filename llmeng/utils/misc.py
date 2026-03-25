@@ -1,22 +1,6 @@
 from __future__ import annotations
 
 
-def call_if_main(name: str = "__main__", discard: bool | None = None):
-    """Decorator to ensure a function will call when the script is run as main."""
-    if name != "__main__":
-        discard = False if discard is None else discard
-        if discard:
-            return lambda _: None
-        else:
-            return lambda f: f
-    else:
-        discard = True if discard is None else discard
-        if discard:
-            return lambda f: (f() or True) and None
-        else:
-            return lambda f: (f() and None) or f
-
-
 def div_even(a: int, b: int) -> int:
     """Divides two integers"""
     assert a % b == 0, f"{a = } must be divisible by {b = }"
@@ -26,6 +10,20 @@ def div_even(a: int, b: int) -> int:
 def div_ceil(a: int, b: int) -> int:
     """Divides two integers, rounding up"""
     return (a + b - 1) // b
+
+
+def split_kv_heads(
+    num_kv_heads: int, tp_size: int, tp_rank: int
+) -> tuple[int, int, int]:
+    """Map a TP rank to KV-head shard info, allowing KV replication."""
+    if num_kv_heads >= tp_size:
+        return div_even(num_kv_heads, tp_size), tp_rank, tp_size
+
+    assert tp_size % num_kv_heads == 0, (
+        f"{tp_size = } must be divisible by {num_kv_heads = } when KV heads are replicated"
+    )
+    kv_replication = div_even(tp_size, num_kv_heads)
+    return 1, tp_rank // kv_replication, num_kv_heads
 
 
 def align_ceil(a: int, b: int) -> int:

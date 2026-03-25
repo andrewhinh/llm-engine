@@ -6,14 +6,14 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Literal, Tuple
+from typing import Callable, Dict, List, Literal, Tuple, cast
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from starlette.background import BackgroundTask
 
 from llmeng.core import SamplingParams
@@ -36,6 +36,42 @@ logger = init_logger(__name__, "FrontendAPI")
 _GLOBAL_STATE: "FrontendManager | None" = None
 
 
+def _message_content_to_text(content: str | List[Dict[str, object]]) -> str:
+    if isinstance(content, str):
+        return content
+
+    text_parts: List[str] = []
+    for item in content:
+        text = item.get("text")
+        if item.get("type") == "text" and isinstance(text, str):
+            text_parts.append(text)
+        else:
+            text_parts.append(json.dumps(item))
+    return "".join(text_parts)
+
+
+def _serialize_message(
+    message: "Message | Dict[str, str] | Dict[str, object]",
+) -> Dict[str, str]:
+    content: str | List[Dict[str, object]] | None
+    if isinstance(message, dict):
+        role = message.get("role")
+        raw_content = message.get("content")
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif isinstance(raw_content, list):
+            content = cast(List[Dict[str, object]], raw_content)
+        else:
+            content = None
+    else:
+        role = message.role
+        content = message.content
+    assert role is not None, "Message role must be set"
+    assert content is not None, "Message content must be set"
+    assert isinstance(content, (str, list)), "Message content must be serializable"
+    return {"role": str(role), "content": _message_content_to_text(content)}
+
+
 def get_global_state() -> FrontendManager:
     global _GLOBAL_STATE
     assert _GLOBAL_STATE is not None, "Global state is not initialized"
@@ -53,7 +89,7 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
 
 async def _send_request(
     state: "FrontendManager",
-    text: str | List[Message],
+    text: str | List[Message | Dict[str, str]],
     *,
     max_tokens: int,
     temperature: float = 1.0,
@@ -63,9 +99,7 @@ async def _send_request(
 ) -> int:
     uid = state.new_user()
     text_for_msg: str | List[Dict[str, str]] = (
-        [{"role": m.role, "content": m.content} for m in text]
-        if isinstance(text, list)
-        else text
+        [_serialize_message(m) for m in text] if isinstance(text, list) else text
     )
     await state.send_one(
         TokenizeMsg(
@@ -91,7 +125,7 @@ class GenerateRequest(BaseModel):
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: str
+    content: str | List[Dict[str, object]]
 
 
 class OpenAICompletionRequest(BaseModel):
@@ -102,14 +136,17 @@ class OpenAICompletionRequest(BaseModel):
     prompt: str | None = None
     messages: List[Message] | None = None
 
-    max_tokens: int = 16
+    max_tokens: int = Field(
+        default=16,
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
+    )
     temperature: float = 1.0
 
     top_k: int = -1
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
-    stop: List[str] = Field(default_factory=list)
+    stop: str | List[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
 
@@ -191,9 +228,11 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_chat_completions(self, uid: int):
+        completion_id = f"chatcmpl-{uid}"
+        created = int(time.time())
         first_chunk = True
         async for ack in self.wait_for_ack(uid):
-            delta = {}
+            delta = {"content": ""}
             if first_chunk:
                 delta["role"] = "assistant"
                 first_chunk = False
@@ -201,8 +240,10 @@ class FrontendManager:
                 delta["content"] = ack.incremental_output
 
             chunk = {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": self.config.model_path,
                 "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
             }
             yield f"data: {json.dumps(chunk)}\n\n".encode()
@@ -212,13 +253,38 @@ class FrontendManager:
 
         # send final finish_reason
         end_chunk = {
-            "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self.config.model_path,
+            "choices": [
+                {"delta": {"content": ""}, "index": 0, "finish_reason": "stop"}
+            ],
         }
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
+
+    async def complete_chat_completions(self, uid: int) -> Dict[str, object]:
+        chunks: List[str] = []
+        async for ack in self.wait_for_ack(uid):
+            if ack.incremental_output:
+                chunks.append(ack.incremental_output)
+            if ack.finished:
+                break
+        return {
+            "id": f"chatcmpl-{uid}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": self.config.model_path,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "".join(chunks)},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         try:
@@ -286,7 +352,7 @@ async def v1_root():
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
     if req.messages:
-        prompt = [msg.model_dump() for msg in req.messages]
+        prompt = [_serialize_message(msg) for msg in req.messages]
     else:
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
@@ -300,6 +366,9 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
         top_p=req.top_p,
         ignore_eos=req.ignore_eos,
     )
+
+    if not req.stream:
+        return await state.complete_chat_completions(uid)
 
     return StreamingResponse(
         state.stream_with_cancellation(
@@ -320,11 +389,9 @@ async def available_models():
 async def shell_completion(req: OpenAICompletionRequest):
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [msg.model_dump() for msg in req.messages]
-
     uid = await _send_request(
         state,
-        prompt,
+        cast(List[Message | Dict[str, str]], req.messages),
         max_tokens=req.max_tokens,
         temperature=req.temperature,
         top_k=req.top_k,
