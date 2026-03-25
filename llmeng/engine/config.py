@@ -5,6 +5,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, List
 
 import torch
+
 from llmeng.distributed import DistributedInfo
 from llmeng.utils import cached_load_hf_config
 
@@ -26,7 +27,7 @@ class EngineConfig:
     memory_ratio: float = 0.9
     distributed_timeout: float = 60.0
     use_dummy_weight: bool = False
-    use_pynccl: bool = True
+    use_nccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = (
         None  # if not None, will override the number of pages

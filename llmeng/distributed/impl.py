@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 if TYPE_CHECKING:
     from llmeng.distributed import DistributedInfo
-    from llmeng.kernel import PyNCCLCommunicator
+    from llmeng.kernel import NcclCommunicator, init_nccl
 
 
 @dataclass
@@ -23,60 +23,42 @@ class DistributedImpl(ABC):
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
+    group: torch.distributed.ProcessGroup | None = None
+    world_size: int = 1
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = dist.get_world_size()
-        if tp_size == 1:
+        if self.world_size == 1:
             return x
-        dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.group)
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        tp_size = dist.get_world_size()
-        if tp_size == 1:
+        if self.world_size == 1:
             return x
         shape = list(x.shape)
-        shape[0] = shape[0] * tp_size
+        shape[0] = shape[0] * self.world_size
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
-        dist.all_gather_into_tensor(out, x)
+        dist.all_gather_into_tensor(out, x, group=self.group)
         return out
 
 
 @dataclass
-class PyNCCLDistributedImpl(DistributedImpl):
-    comm: PyNCCLCommunicator
+class NcclDistributedImpl(DistributedImpl):
+    comm: NcclCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         self.comm.all_reduce(x, "sum")
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        from .info import get_tp_info
-
-        world_size = get_tp_info().size
         output_shape = list(x.shape)
-        output_shape[0] *= world_size
+        output_shape[0] *= self.comm.world_size
         result = x.new_empty(output_shape)
         self.comm.all_gather(result, x)
         return result
 
-
-@dataclass
-class PennyDistributedImpl(DistributedImpl):
-    comm: PyNCCLCommunicator
-
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        self.comm.all_reduce(x, "sum")
-        return x
-
-    def all_gather(self, x: torch.Tensor) -> torch.Tensor:
-        from .info import get_tp_info
-
-        world_size = get_tp_info().size
-        output_shape = list(x.shape)
-        output_shape[0] = output_shape[0] * world_size
-        result = x.new_empty(output_shape)
-        self.comm.all_gather(result, x)
-        return result
+    def destroy(self) -> None:
+        self.comm.destroy()
 
 
 class DistributedCommunicator:
@@ -89,42 +71,57 @@ class DistributedCommunicator:
         return self.plugins[-1].all_gather(x)
 
 
-def enable_pynccl_distributed(
+def configure_torch_distributed(
+    tp_group: torch.distributed.ProcessGroup | None,
+    tp_world_size: int,
+) -> None:
+    DistributedCommunicator.plugins[0] = TorchDistributedImpl(
+        group=tp_group,
+        world_size=tp_world_size,
+    )
+
+
+def enable_nccl_distributed(
     tp_info: DistributedInfo,
     tp_cpu_group: torch.distributed.ProcessGroup,
     max_bytes: int,
 ) -> None:
     """
-    Enable PyNCCL-based distributed communication for tensor parallelism.
+    Enable nccl4py-based distributed communication for tensor parallelism.
     """
     if tp_info.size == 1:
         return
-    global_world_size = dist.get_world_size(group=tp_cpu_group)
-    if global_world_size == 1:
+    tp_group_size = dist.get_world_size(group=tp_cpu_group)
+    if tp_group_size == 1:
         return
-    # Multi-node: Penny/NVSHMEM intranode-only; NCCL ext has torch ABI issues.
-    # Use TorchDistributedImpl (gloo) which is already the default.
-    if global_world_size > tp_info.size:
+    if tp_group_size != tp_info.size:
         return
-    from llmeng.kernel import init_pynccl
+    tp_group_rank = dist.get_rank(group=tp_cpu_group)
 
-    comm = init_pynccl(
+    comm = init_nccl(
         local_rank=tp_info.rank,
         local_size=tp_info.size,
-        global_rank=dist.get_rank(group=tp_cpu_group),
-        global_size=global_world_size,
+        global_rank=tp_group_rank,
+        global_size=tp_group_size,
         tp_cpu_group=tp_cpu_group,
         max_size_bytes=max_bytes,
     )
-
-    if hasattr(comm, "_ca"):
-        DistributedCommunicator.plugins.append(PennyDistributedImpl(comm))
-    else:
-        DistributedCommunicator.plugins.append(PyNCCLDistributedImpl(comm))
+    DistributedCommunicator.plugins.append(NcclDistributedImpl(comm))
 
 
 def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
-    DistributedCommunicator.plugins = []
+    for plugin in reversed(DistributedCommunicator.plugins[1:]):
+        destroy = getattr(plugin, "destroy", None)
+        if callable(destroy):
+            destroy()
+            continue
+        comm = getattr(plugin, "comm", None)
+        if comm is None:
+            continue
+        destroy = getattr(comm, "destroy", None) or getattr(comm, "close", None)
+        if callable(destroy):
+            destroy()
+    DistributedCommunicator.plugins = [TorchDistributedImpl()]

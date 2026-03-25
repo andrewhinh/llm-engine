@@ -1,7 +1,7 @@
 import asyncio
 import pathlib
 
-from llmeng.modal import app, get_runtime_image, MINUTES
+from llmeng.modal import app, get_runtime_image
 
 GPU_TYPE = "h200"
 BLACKWELL_GPU_TYPE = "b200"

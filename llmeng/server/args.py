@@ -125,12 +125,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Use dummy weights for testing.",
     )
 
-    assert ServerArgs.use_pynccl
+    assert ServerArgs.use_nccl
     parser.add_argument(
-        "--disable-pynccl",
+        "--disable-nccl",
         action="store_false",
-        dest="use_pynccl",
-        help="Disable PyNCCL for tensor parallelism.",
+        dest="use_nccl",
+        help="Disable nccl4py collectives for tensor parallelism.",
     )
 
     parser.add_argument(
@@ -290,7 +290,7 @@ def build_cli_args(
     num_page_override: int,
     num_tokenizer: int | None,
     cuda_graph_max_bs: int | None,
-    use_pynccl: bool,
+    use_nccl: bool,
 ) -> List[str]:
     args = [
         "--model-path",
@@ -330,10 +330,10 @@ def build_cli_args(
     if num_tokenizer is not None:
         args.extend(["--num-tokenizer", str(num_tokenizer)])
 
-    if cuda_graph_max_bs is not None and cuda_graph_max_bs > 0:
+    if cuda_graph_max_bs is not None:
         args.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
 
-    if not use_pynccl:
-        args.append("--disable-pynccl")
+    if not use_nccl:
+        args.append("--disable-nccl")
 
     return args

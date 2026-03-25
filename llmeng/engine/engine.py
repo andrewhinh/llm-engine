@@ -11,7 +11,7 @@ from llmeng.distributed import (
     DistributedInfo,
     configure_torch_distributed,
     destroy_distributed,
-    enable_pynccl_distributed,
+    enable_nccl_distributed,
     set_tp_info,
 )
 from llmeng.kvcache import create_kvcache_pool
@@ -142,9 +142,9 @@ class Engine:
         global_rank = config.tp_info.resolved_global_rank
         global_world_size = config.tp_info.resolved_global_size
         tp_ranks = _node_local_tp_ranks(config.tp_info)
-        use_pynccl_wrapper = config.tp_info.size > 1 and config.use_pynccl
+        use_nccl_wrapper = config.tp_info.size > 1 and config.use_nccl
         torch.distributed.init_process_group(
-            backend="gloo" if use_pynccl_wrapper or global_world_size == 1 else "nccl",
+            backend="gloo" if use_nccl_wrapper or global_world_size == 1 else "nccl",
             rank=global_rank,
             world_size=global_world_size,
             timeout=timedelta(seconds=config.distributed_timeout),
@@ -155,14 +155,14 @@ class Engine:
         if config.tp_info.size == 1:
             configure_torch_distributed(None, 1)
             return tp_cpu_group
-        if use_pynccl_wrapper:
+        if use_nccl_wrapper:
             configure_torch_distributed(None, 1)
             max_bytes = (
                 config.max_forward_len
                 * config.model_config.hidden_size
                 * self.dtype.itemsize
             )
-            enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+            enable_nccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
             tp_device_group = torch.distributed.new_group(
                 ranks=tp_ranks, backend="nccl"

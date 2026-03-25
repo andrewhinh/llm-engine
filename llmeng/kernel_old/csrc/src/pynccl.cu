@@ -78,16 +78,18 @@ public:
     NCCL_CHECK(::ncclCommInitRank(&comm, m_world_size, id, m_rank));
     m_comm = {comm, template_fn<::ncclCommDestroy>};
 
-    void *buf;
-    NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
-    m_sym_mem = {buf, template_fn<::ncclMemFree>};
+    if (m_max_bytes > 0) {
+      void *buf;
+      NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
+      m_sym_mem = {buf, template_fn<::ncclMemFree>};
 
-    ncclWindow_t win;
-    NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
-                                        NCCL_WIN_COLL_SYMMETRIC));
-    m_win = {win, [comm = m_comm](ncclWindow_t w) {
-               return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
-             }};
+      ncclWindow_t win;
+      NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
+                                          NCCL_WIN_COLL_SYMMETRIC));
+      m_win = {win, [comm = m_comm](ncclWindow_t w) {
+                 return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
+               }};
+    }
   }
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
