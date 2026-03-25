@@ -61,11 +61,12 @@ def compare_memory_kernel_perf(
     torch_impl: Callable[[], Any],
     old_impl: Callable[[], Any],
     new_impl: Callable[[], Any],
+    cutile_impl: Callable[[], Any] | None = None,
     memory_footprint: int,
     description: str = " ",
     extra_kwargs: Dict[str, Any] | None = None,
     need_latency: bool = True,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float | None]:
     extra_kwargs = extra_kwargs or {}
 
     dur = perf_cuda(torch_impl, **extra_kwargs)
@@ -83,8 +84,17 @@ def compare_memory_kernel_perf(
     latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
     message_2 = f"New Impl: {latency_msg}{bandwidth_2:8.3f} GB/s"
 
-    logger.info(f"{description}{message_0} | {message_1} | {message_2}")
-    return bandwidth_0, bandwidth_1, bandwidth_2
+    if cutile_impl is None:
+        logger.info(f"{description}{message_0} | {message_1} | {message_2}")
+        return bandwidth_0, bandwidth_1, bandwidth_2, None
+
+    dur = perf_cuda(cutile_impl, **extra_kwargs)
+    bandwidth_3 = memory_footprint / (dur * 1e6)
+    latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
+    message_3 = f"cuTile Impl: {latency_msg}{bandwidth_3:8.3f} GB/s"
+
+    logger.info(f"{description}{message_0} | {message_1} | {message_2} | {message_3}")
+    return bandwidth_0, bandwidth_1, bandwidth_2, bandwidth_3
 
 
 def perf_host(
@@ -105,21 +115,24 @@ def perf_host(
 
 def compare_latency_kernel_perf(
     *,
-    torch_impl: Callable[[], Any],
+    torch_impl: Callable[[], Any] | None = None,
     old_impl: Callable[[], Any],
     new_impl: Callable[[], Any],
     description: str = " ",
     warmup: int = 25,
     repetitions: int = 250,
 ) -> Tuple[float, float, float]:
-    dur_0 = perf_host(torch_impl, warmup=warmup, repetitions=repetitions)
+    message_parts: list[str] = []
+    if torch_impl is None:
+        dur_0 = float("nan")
+    else:
+        dur_0 = perf_host(torch_impl, warmup=warmup, repetitions=repetitions)
+        message_parts.append(f"Torch Impl: {dur_0:8.3f} ms")
     dur_1 = perf_host(old_impl, warmup=warmup, repetitions=repetitions)
     dur_2 = perf_host(new_impl, warmup=warmup, repetitions=repetitions)
-    logger.info(
-        f"{description}Torch Impl: {dur_0:8.3f} ms | "
-        f"Old Impl: {dur_1:8.3f} ms | "
-        f"New Impl: {dur_2:8.3f} ms"
-    )
+    message_parts.append(f"Old Impl: {dur_1:8.3f} ms")
+    message_parts.append(f"New Impl: {dur_2:8.3f} ms")
+    logger.info(f"{description}{' | '.join(message_parts)}")
     return dur_0, dur_1, dur_2
 
 
