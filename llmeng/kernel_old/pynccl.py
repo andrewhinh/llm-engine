@@ -51,7 +51,8 @@ def init_pynccl(
 ) -> PyNCCLCommunicator:
     import torch
 
-    max_size_bytes = min(max_size_bytes, ENV.PYNCCL_MAX_BUFFER_SIZE.value)
+    max_buffer_size = getattr(ENV, "PYNCCL_MAX_BUFFER_SIZE", ENV.NCCL_MAX_BUFFER_SIZE)
+    max_size_bytes = min(max_size_bytes, max_buffer_size.value)
 
     module = _load_nccl_module()
     cls = _get_pynccl_wrapper_cls()
@@ -74,5 +75,4 @@ def init_pynccl(
     nccl_id = id_list[0]
     assert nccl_id is not None, f"Failed to get NCCL unique ID on {tp_rank = }"
 
-    # bypass type checking for the FFI object
-    return cls(tp_rank, tp_size, max_size_bytes, nccl_id)  # type: ignore
+    return cls(tp_rank, tp_size, max_size_bytes, nccl_id)

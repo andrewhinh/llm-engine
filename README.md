@@ -75,8 +75,9 @@ modal run benchmark/online/bench_simple.py
 ## Roadmap
 
 - [x] port mini-sglang to Modal
-- [x] replace nccl with penny
-- [ ] rewrite C++/CUDA/Triton in Cute-DSL
+- [ ] ~~replace nccl with penny~~
+  - nccl4py incompatible with nvshmem4py, so reverted for now
+- [x] rewrite C++/CUDA in Python
 - [ ] add speculative speculative decoding (SSD)
 
 ## Credit

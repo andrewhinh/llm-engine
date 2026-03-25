@@ -57,10 +57,10 @@ def fused_moe_kernel_triton(
         B.stride(1),
         C.stride(1),
         C.stride(2),
-        MUL_ROUTED_WEIGHT=mul_routed_weight,  # type: ignore
-        top_k=top_k,  # type: ignore
-        compute_type=dtype,  # type: ignore
-        even_Ks=even_Ks,  # type: ignore
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=dtype,
+        even_Ks=even_Ks,
         **config,
     )
 
@@ -89,7 +89,7 @@ def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
     moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
-        output,  # type: ignore
+        output,
         *output.stride(),
         token_num=token_num,
         topk_num=topk_num,
@@ -97,5 +97,5 @@ def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
         BLOCK_M=BLOCK_M,
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
-        num_warps=num_warps,  # type: ignore
+        num_warps=num_warps,
     )

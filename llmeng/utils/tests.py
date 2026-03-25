@@ -60,41 +60,37 @@ def compare_memory_kernel_perf(
     *,
     torch_impl: Callable[[], Any],
     old_impl: Callable[[], Any],
-    new_impl: Callable[[], Any],
+    new_impl: Callable[[], Any] | None = None,
     cutile_impl: Callable[[], Any] | None = None,
     memory_footprint: int,
     description: str = " ",
     extra_kwargs: Dict[str, Any] | None = None,
     need_latency: bool = True,
-) -> Tuple[float, float, float, float | None]:
+) -> Tuple[float, float, float | None, float | None]:
     extra_kwargs = extra_kwargs or {}
 
-    dur = perf_cuda(torch_impl, **extra_kwargs)
-    bandwidth_0 = memory_footprint / (dur * 1e6)
-    latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
-    message_0 = f"Torch Impl: {latency_msg}{bandwidth_0:8.3f} GB/s"
+    def _measure(fn: Callable[[], Any], label: str) -> tuple[float, str]:
+        dur = perf_cuda(fn, **extra_kwargs)
+        value = memory_footprint / (dur * 1e6)
+        latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
+        return value, f"{label}: {latency_msg}{value:8.3f} GB/s"
 
-    dur = perf_cuda(old_impl, **extra_kwargs)
-    bandwidth_1 = memory_footprint / (dur * 1e6)
-    latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
-    message_1 = f"Old Impl: {latency_msg}{bandwidth_1:8.3f} GB/s"
+    value_0, message_0 = _measure(torch_impl, "Torch Impl")
+    value_1, message_1 = _measure(old_impl, "Old Impl")
+    message_parts = [message_0, message_1]
 
-    dur = perf_cuda(new_impl, **extra_kwargs)
-    bandwidth_2 = memory_footprint / (dur * 1e6)
-    latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
-    message_2 = f"New Impl: {latency_msg}{bandwidth_2:8.3f} GB/s"
+    value_2 = None
+    if new_impl is not None:
+        value_2, message_2 = _measure(new_impl, "New Impl")
+        message_parts.append(message_2)
 
-    if cutile_impl is None:
-        logger.info(f"{description}{message_0} | {message_1} | {message_2}")
-        return bandwidth_0, bandwidth_1, bandwidth_2, None
+    value_3 = None
+    if cutile_impl is not None:
+        value_3, message_3 = _measure(cutile_impl, "cuTile Impl")
+        message_parts.append(message_3)
 
-    dur = perf_cuda(cutile_impl, **extra_kwargs)
-    bandwidth_3 = memory_footprint / (dur * 1e6)
-    latency_msg = f"{dur:8.3f} ms | " if need_latency else ""
-    message_3 = f"cuTile Impl: {latency_msg}{bandwidth_3:8.3f} GB/s"
-
-    logger.info(f"{description}{message_0} | {message_1} | {message_2} | {message_3}")
-    return bandwidth_0, bandwidth_1, bandwidth_2, bandwidth_3
+    logger.info(f"{description}{' | '.join(message_parts)}")
+    return value_0, value_1, value_2, value_3
 
 
 def perf_host(

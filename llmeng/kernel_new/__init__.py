@@ -1,6 +1,6 @@
 from .fused_moe import (
-    fused_moe_kernel,
-    moe_sum_reduce_kernel,
+    fused_moe_kernel_triton,
+    moe_sum_reduce_triton,
 )
 from .index import indexing
 from .nccl import NcclCommunicator, init_nccl
@@ -15,6 +15,6 @@ __all__ = [
     "test_tensor",
     "init_nccl",
     "NcclCommunicator",
-    "fused_moe_kernel",
-    "moe_sum_reduce_kernel",
+    "fused_moe_kernel_triton",
+    "moe_sum_reduce_triton",
 ]
