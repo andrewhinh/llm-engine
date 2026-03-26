@@ -36,6 +36,10 @@ You can specify the following environment variables:
 - `GPU_TYPE`: GPU type (`l4`, `l40s`, `a100`, `a100-40gb`, `a100-80gb`, `rtx-pro-6000`, `h100/h100!`, `h200`, `b200/b200+`, default=`a100`)
 - `RDMA`: whether to use RDMA (`0` or `1`, default=`0`)
 
+```bash
+modal serve llmeng/api.py
+```
+
 _Note that for multi-node deployment on Hopper and Blackwell chips, your Modal workspace must have RDMA support._
 
 Run the benchmark suite.
@@ -52,10 +56,6 @@ Work is parallelized across engine/model servers. Within each server, data workl
 
 ```bash
 modal run benchmark/main.py
-```
-
-```bash
-modal serve llmeng/api.py
 ```
 
 Run the tests.
