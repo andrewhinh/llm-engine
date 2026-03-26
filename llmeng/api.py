@@ -165,7 +165,7 @@ def create_model_server_class(
     if nnode > 1:
         decorated = modal.experimental.clustered(size=nnode, rdma=RDMA)(decorated)
     decorated = app.cls(
-        image=get_runtime_image(engine),
+        image=get_runtime_image(engine=engine, gpu_type=gpu_type),
         gpu=f"{gpu_type}:{n_gpu}",
         startup_timeout=30 * MINUTES,
         timeout=30 * MINUTES,
