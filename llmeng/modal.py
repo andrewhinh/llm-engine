@@ -16,6 +16,14 @@ if not (1 <= N_GPU <= 8):
 GPU_TYPE = os.environ.get("GPU_TYPE", "a100").strip().lower()
 RDMA = os.environ.get("RDMA", "0").lower() == "1"
 
+
+def get_startup_metrics_dict() -> modal.Dict:
+    return modal.Dict.from_name(
+        "llm-engine-startup-metrics",
+        create_if_missing=True,
+    )
+
+
 # Secrets
 hf_secret = modal.Secret.from_name("huggingface-secret")
 

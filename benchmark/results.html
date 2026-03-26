@@ -1,0 +1,1163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Benchmark Results</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #f8f7f3;
+      --panel: #fcfbf8;
+      --border: #cfc9bc;
+      --text: #2d3a2a;
+      --muted: #647062;
+      --accent: #51623b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 24px 40px;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 22px 24px;
+      text-align: center;
+      line-height: 1.8;
+      font-size: 20px;
+    }
+    .card.small {
+      font-size: 17px;
+      line-height: 1.6;
+    }
+    select {
+      font: inherit;
+      color: var(--text);
+      background: #eef0e8;
+      border: 1px solid #a7ad9f;
+      border-radius: 6px;
+      padding: 6px 12px;
+      min-width: 0;
+    }
+    .chart-wrap {
+      background: linear-gradient(180deg, rgba(255,255,255,0.7), rgba(255,255,255,0.96));
+      border: 1px solid var(--border);
+      padding: 20px 18px 8px;
+    }
+    .status {
+      min-height: 22px;
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 14px;
+      text-align: center;
+    }
+    .canvas-shell {
+      position: relative;
+      width: 100%;
+      height: 560px;
+    }
+    canvas {
+      display: block;
+      width: 100% !important;
+      height: 100% !important;
+    }
+    .footer-controls {
+      display: flex;
+      justify-content: center;
+      gap: 28px;
+      align-items: center;
+      margin-top: 14px;
+      color: var(--accent);
+      font-size: 15px;
+    }
+    .footer-controls label {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+    }
+    @media (max-width: 900px) {
+      .controls {
+        grid-template-columns: 1fr;
+      }
+      .footer-controls {
+        flex-direction: column;
+        gap: 12px;
+      }
+      .card {
+        font-size: 18px;
+      }
+      .canvas-shell {
+        height: 420px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="controls">
+      <div class="card">
+        I want to serve
+        <select id="model-select"></select>
+        <br>
+        with
+        <select id="engine-select"></select>
+      </div>
+      <div class="card">
+        Clients should receive
+        <select id="latency-select"></select>
+        <br>
+        in under
+        <select id="slo-select"></select>
+        95% of the time
+      </div>
+      <div class="card">
+        I expect on average
+        <br>
+        <select id="workload-select"></select>
+      </div>
+      <div class="card">
+        I want to see
+        <select id="show-select"></select>
+        <br>
+        configuration
+      </div>
+    </div>
+
+    <div class="chart-wrap">
+      <p id="status" class="status"></p>
+      <div class="canvas-shell">
+        <canvas id="benchmark-chart"></canvas>
+      </div>
+      <div class="footer-controls">
+        <label>
+          Metric:
+          <select id="metric-select"></select>
+        </label>
+        <label>
+          Aggregate:
+          <select id="aggregate-select"></select>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const DATA = {
+  "points": [
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.4482673664064537,
+      "ttft_median": 0.20651984214782715,
+      "ttft_p90": 0.25066351890563965,
+      "ttft_p95": 0.28116464614868164,
+      "ttlt_median": 13.989706039428711,
+      "ttlt_p90": 14.048581838607788,
+      "ttlt_p95": 14.054656267166138,
+      "itl_median": 0.01345319761908299,
+      "itl_p90": 0.01350766379579188,
+      "itl_p95": 0.01351268923061218
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.8917451487453467,
+      "ttft_median": 0.22417140007019043,
+      "ttft_p90": 0.25670933723449707,
+      "ttft_p95": 0.2905087471008301,
+      "ttlt_median": 14.525789022445679,
+      "ttlt_p90": 14.597737789154053,
+      "ttlt_p95": 14.631009101867676,
+      "itl_median": 0.013971394457775127,
+      "itl_p90": 0.014046710956830783,
+      "itl_p95": 0.014055535240956415
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.3222636007367965,
+      "ttft_median": 0.24636125564575195,
+      "ttft_p90": 0.3109920024871826,
+      "ttft_p95": 0.346372127532959,
+      "ttlt_median": 15.151751279830933,
+      "ttlt_p90": 15.237891912460327,
+      "ttlt_p95": 15.291868925094604,
+      "itl_median": 0.01454918661891307,
+      "itl_p90": 0.014600601597149234,
+      "itl_p95": 0.014632696513439786
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.0522538882985681,
+      "ttft_median": 0.4847419261932373,
+      "ttft_p90": 0.7097690105438232,
+      "ttft_p95": 0.790266752243042,
+      "ttlt_median": 40.045856952667236,
+      "ttlt_p90": 54.7378134727478,
+      "ttlt_p95": 55.9922935962677,
+      "itl_median": 0.03854416985199482,
+      "itl_p90": 0.05252408841488298,
+      "itl_p95": 0.05387587188392557
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.0243121422513568,
+      "ttft_median": 0.5281574726104736,
+      "ttft_p90": 0.881310224533081,
+      "ttft_p95": 0.9116485118865967,
+      "ttlt_median": 59.74810004234314,
+      "ttlt_p90": 71.60432600975037,
+      "ttlt_p95": 72.0037636756897,
+      "itl_median": 0.057714589297014014,
+      "itl_p90": 0.06907893951803824,
+      "itl_p95": 0.069296671148619
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.0447882172141716,
+      "ttft_median": 0.6551799774169922,
+      "ttft_p90": 2.446611166000366,
+      "ttft_p95": 2.896561861038208,
+      "ttlt_median": 64.19784283638,
+      "ttlt_p90": 68.69529700279236,
+      "ttlt_p95": 75.59264588356018,
+      "itl_median": 0.06158545033556508,
+      "itl_p90": 0.0660108459543506,
+      "itl_p95": 0.0711246772012869
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.9570395933972178,
+      "ttft_median": 0.6411347389221191,
+      "ttft_p90": 4.397103786468506,
+      "ttft_p95": 4.948872327804565,
+      "ttlt_median": 74.40972256660461,
+      "ttlt_p90": 82.33641529083252,
+      "ttlt_p95": 82.96504092216492,
+      "itl_median": 0.07180811489548967,
+      "itl_p90": 0.07506464746574036,
+      "itl_p95": 0.07604809613754555
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.0352850567348721,
+      "ttft_median": 0.6279754638671875,
+      "ttft_p90": 12.025167465209961,
+      "ttft_p95": 18.105695724487305,
+      "ttlt_median": 65.74251055717468,
+      "ttlt_p90": 76.08485436439514,
+      "ttlt_p95": 82.9495153427124,
+      "itl_median": 0.06278160823288784,
+      "itl_p90": 0.06460203266796362,
+      "itl_p95": 0.06519452451144728
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.4813952491824822,
+      "ttft_median": 0.18947052955627441,
+      "ttft_p90": 0.22723078727722168,
+      "ttft_p95": 0.3080766201019287,
+      "ttlt_median": 6.318464040756226,
+      "ttlt_p90": 6.371356010437012,
+      "ttlt_p95": 6.680650234222412,
+      "itl_median": 0.005988047852427612,
+      "itl_p90": 0.006030584710084798,
+      "itl_p95": 0.006042822365187481
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.9512790312565107,
+      "ttft_median": 0.19777512550354004,
+      "ttft_p90": 0.22320079803466797,
+      "ttft_p95": 0.23755669593811035,
+      "ttlt_median": 7.355921268463135,
+      "ttlt_p90": 7.418106317520142,
+      "ttlt_p95": 7.428710222244263,
+      "itl_median": 0.006990751329871333,
+      "itl_p90": 0.007042118065051902,
+      "itl_p95": 0.007048952730986147
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.3634059345720217,
+      "ttft_median": 0.24425649642944336,
+      "ttft_p90": 0.28188371658325195,
+      "ttft_p95": 0.2930126190185547,
+      "ttlt_median": 8.761577844619751,
+      "ttlt_p90": 10.638113737106323,
+      "ttlt_p95": 11.285479307174683,
+      "itl_median": 0.008315960566202799,
+      "itl_p90": 0.010119016802089539,
+      "itl_p95": 0.010745764477861242
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.681495205734826,
+      "ttft_median": 0.38693881034851074,
+      "ttft_p90": 0.564262866973877,
+      "ttft_p95": 0.5893344879150391,
+      "ttlt_median": 36.93025016784668,
+      "ttlt_p90": 72.47347593307495,
+      "ttlt_p95": 76.1223087310791,
+      "itl_median": 0.03544138184041222,
+      "itl_p90": 0.07013519185495982,
+      "itl_p95": 0.07372187029930853
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.4699430963975457,
+      "ttft_median": 0.3649895191192627,
+      "ttft_p90": 0.5539369583129883,
+      "ttft_p95": 0.6231207847595215,
+      "ttlt_median": 70.4254047870636,
+      "ttlt_p90": 94.68835353851318,
+      "ttlt_p95": 96.86224508285522,
+      "itl_median": 0.06834586974113217,
+      "itl_p90": 0.09181306905177797,
+      "itl_p95": 0.09397446351783134
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.5370689303887721,
+      "ttft_median": 0.45401763916015625,
+      "ttft_p90": 0.6591682434082031,
+      "ttft_p95": 0.7067692279815674,
+      "ttlt_median": 81.52737712860107,
+      "ttlt_p90": 97.65609335899353,
+      "ttlt_p95": 98.37769222259521,
+      "itl_median": 0.07911673645586328,
+      "itl_p90": 0.09448416631592334,
+      "itl_p95": 0.09533358529166393
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.3529733351487925,
+      "ttft_median": 0.35758447647094727,
+      "ttft_p90": 0.4832308292388916,
+      "ttft_p95": 0.5127410888671875,
+      "ttlt_median": 87.97820663452148,
+      "ttlt_p90": 106.01137399673462,
+      "ttlt_p95": 107.17098999023438,
+      "itl_median": 0.08551422685006031,
+      "itl_p90": 0.10289993453934745,
+      "itl_p95": 0.10411508947989574
+    },
+    {
+      "engine": "llmeng",
+      "engine_label": "llm-engine",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.5544538670129897,
+      "ttft_median": 0.4798290729522705,
+      "ttft_p90": 0.7657408714294434,
+      "ttft_p95": 0.7842566967010498,
+      "ttlt_median": 93.17526006698608,
+      "ttlt_p90": 103.02991962432861,
+      "ttlt_p95": 103.52496433258057,
+      "itl_median": 0.09038958801202411,
+      "itl_p90": 0.09971939573539668,
+      "itl_p95": 0.10029898221192123
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.29753232709095656,
+      "ttft_median": 0.35324597358703613,
+      "ttft_p90": 0.4576437473297119,
+      "ttft_p95": 0.5277135372161865,
+      "ttlt_median": 44.365171670913696,
+      "ttlt_p90": 76.08921217918396,
+      "ttlt_p95": 81.64726138114929,
+      "itl_median": 0.04291593154504502,
+      "itl_p90": 0.07375417823083007,
+      "itl_p95": 0.07899959439289768
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.13480585791847988,
+      "ttft_median": 0.21208786964416504,
+      "ttft_p90": 0.31567931175231934,
+      "ttft_p95": 0.3600618839263916,
+      "ttlt_median": 56.17041206359863,
+      "ttlt_p90": 103.59532642364502,
+      "ttlt_p95": 109.09374737739563,
+      "itl_median": 0.05426237450317204,
+      "itl_p90": 0.10065546226874357,
+      "itl_p95": 0.10597869075055462
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.10174326432673969,
+      "ttft_median": 0.21195077896118164,
+      "ttft_p90": 0.2752232551574707,
+      "ttft_p95": 0.39542365074157715,
+      "ttlt_median": 82.3369870185852,
+      "ttlt_p90": 105.5471339225769,
+      "ttlt_p95": 113.39903283119202,
+      "itl_median": 0.0800437652237371,
+      "itl_p90": 0.10263994315735639,
+      "itl_p95": 0.11016204816271949
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.06731888248755383,
+      "ttft_median": 0.2061769962310791,
+      "ttft_p90": 0.4277465343475342,
+      "ttft_p95": 0.4277465343475342,
+      "ttlt_median": 97.57622170448303,
+      "ttlt_p90": 116.85687708854675,
+      "ttlt_p95": 116.85687708854675,
+      "itl_median": 0.09494723113051608,
+      "itl_p90": 0.11369891833233577,
+      "itl_p95": 0.11369891833233577
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-32B",
+      "model_label": "Qwen3 32B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.06908150573920459,
+      "ttft_median": 0.21504473686218262,
+      "ttft_p90": 0.30041074752807617,
+      "ttft_p95": 0.30041074752807617,
+      "ttlt_median": 102.17515754699707,
+      "ttlt_p90": 114.64664793014526,
+      "ttlt_p95": 114.64664793014526,
+      "itl_median": 0.09925087013319209,
+      "itl_p90": 0.11145093131042062,
+      "itl_p95": 0.11145093131042062
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.47983373506703786,
+      "ttft_median": 0.32062554359436035,
+      "ttft_p90": 0.3506660461425781,
+      "ttft_p95": 0.3655586242675781,
+      "ttlt_median": 6.699683666229248,
+      "ttlt_p90": 6.769681453704834,
+      "ttlt_p95": 6.80368709564209,
+      "itl_median": 0.006227687656704632,
+      "itl_p90": 0.0062883170585595035,
+      "itl_p95": 0.006313732991819857
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.9508884390041188,
+      "ttft_median": 0.3313100337982178,
+      "ttft_p90": 0.37052464485168457,
+      "ttft_p95": 0.3811469078063965,
+      "ttlt_median": 7.549221754074097,
+      "ttlt_p90": 7.649940490722656,
+      "ttlt_p95": 7.672805309295654,
+      "itl_median": 0.007056231605925052,
+      "itl_p90": 0.007132816174862322,
+      "itl_p95": 0.007160070937633049
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.4119442363326584,
+      "ttft_median": 0.3323979377746582,
+      "ttft_p90": 0.394254207611084,
+      "ttft_p95": 0.4330434799194336,
+      "ttlt_median": 8.555441617965698,
+      "ttlt_p90": 8.694965124130249,
+      "ttlt_p95": 8.71227502822876,
+      "itl_median": 0.008034603803155476,
+      "itl_p90": 0.008144129522851252,
+      "itl_p95": 0.008182306560020409
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.8790819525132596,
+      "ttft_median": 0.34010767936706543,
+      "ttft_p90": 0.405811071395874,
+      "ttft_p95": 0.4530651569366455,
+      "ttlt_median": 9.171546936035156,
+      "ttlt_p90": 9.237330436706543,
+      "ttlt_p95": 9.276196241378784,
+      "itl_median": 0.008616580524985276,
+      "itl_p90": 0.008684159490486511,
+      "itl_p95": 0.008708119042807659
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.7389822482173083,
+      "ttft_median": 0.37499380111694336,
+      "ttft_p90": 0.4794173240661621,
+      "ttft_p95": 0.5249423980712891,
+      "ttlt_median": 9.62631106376648,
+      "ttlt_p90": 19.250147342681885,
+      "ttlt_p95": 26.507777452468872,
+      "itl_median": 0.009021735727379167,
+      "itl_p90": 0.01841311930211758,
+      "itl_p95": 0.025298608246669976
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 1.8142520175278116,
+      "ttft_median": 0.49526262283325195,
+      "ttft_p90": 0.8286416530609131,
+      "ttft_p95": 0.9045135974884033,
+      "ttlt_median": 31.006584405899048,
+      "ttlt_p90": 38.37567949295044,
+      "ttlt_p95": 38.99579477310181,
+      "itl_median": 0.029777681839198076,
+      "itl_p90": 0.03685645949922116,
+      "itl_p95": 0.03754920810315383
+    },
+    {
+      "engine": "minisgl",
+      "engine_label": "mini-sglang",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "model_label": "Qwen3 30B A3B",
+      "gpu_type": "b200",
+      "gpu_label": "B200",
+      "n_gpu": 1,
+      "workload_value": "128;1024",
+      "workload_label": "128 tokens in / 1024 tokens out",
+      "rate_type": "constant",
+      "throughput_per_replica": 0.8816853207697752,
+      "ttft_median": 0.578571081161499,
+      "ttft_p90": 0.9788727760314941,
+      "ttft_p95": 1.1402246952056885,
+      "ttlt_median": 77.0019600391388,
+      "ttlt_p90": 82.59481716156006,
+      "ttlt_p95": 82.86558294296265,
+      "itl_median": 0.07459366473051576,
+      "itl_p90": 0.079622074306186,
+      "itl_p95": 0.07992702192341943
+    }
+  ],
+  "modelOptions": [
+    {
+      "value": "all",
+      "label": "any model"
+    },
+    {
+      "value": "Qwen/Qwen3-30B-A3B",
+      "label": "Qwen3 30B A3B"
+    },
+    {
+      "value": "Qwen/Qwen3-32B",
+      "label": "Qwen3 32B"
+    }
+  ],
+  "engineOptions": [
+    {
+      "value": "all",
+      "label": "any engine"
+    },
+    {
+      "value": "llmeng",
+      "label": "llm-engine"
+    },
+    {
+      "value": "minisgl",
+      "label": "mini-sglang"
+    }
+  ],
+  "metricOptions": [
+    {
+      "value": "ttft",
+      "label": "the first token",
+      "chart_label": "Time To First Token",
+      "metric_name": "time_to_first_token_ms",
+      "unit": "ms"
+    },
+    {
+      "value": "ttlt",
+      "label": "the last token",
+      "chart_label": "Time To Last Token",
+      "metric_name": "request_latency",
+      "unit": "s"
+    },
+    {
+      "value": "itl",
+      "label": "each token",
+      "chart_label": "Inter-Token Latency",
+      "metric_name": "inter_token_latency_ms",
+      "unit": "ms"
+    }
+  ],
+  "aggregateOptions": [
+    {
+      "value": "median",
+      "label": "median"
+    },
+    {
+      "value": "p90",
+      "label": "p90"
+    },
+    {
+      "value": "p95",
+      "label": "p95"
+    }
+  ],
+  "workloadOptions": [
+    {
+      "value": "128;1024",
+      "label": "128 tokens in / 1024 tokens out"
+    },
+    {
+      "value": "256;2048",
+      "label": "256 tokens in / 2048 tokens out"
+    },
+    {
+      "value": "512;512",
+      "label": "512 tokens in / 512 tokens out"
+    },
+    {
+      "value": "512;4096",
+      "label": "512 tokens in / 4096 tokens out"
+    },
+    {
+      "value": "1024;128",
+      "label": "1024 tokens in / 128 tokens out"
+    },
+    {
+      "value": "1024;1024",
+      "label": "1024 tokens in / 1024 tokens out"
+    },
+    {
+      "value": "2048;256",
+      "label": "2048 tokens in / 256 tokens out"
+    },
+    {
+      "value": "2048;2048",
+      "label": "2048 tokens in / 2048 tokens out"
+    },
+    {
+      "value": "4096;512",
+      "label": "4096 tokens in / 512 tokens out"
+    }
+  ],
+  "sloOptions": [
+    {
+      "value": 10,
+      "label": "10 ms"
+    },
+    {
+      "value": 30,
+      "label": "30 ms"
+    },
+    {
+      "value": 100,
+      "label": "100 ms"
+    },
+    {
+      "value": 300,
+      "label": "300 ms"
+    },
+    {
+      "value": 1000,
+      "label": "1 second"
+    },
+    {
+      "value": 3000,
+      "label": "3 seconds"
+    },
+    {
+      "value": 10000,
+      "label": "10 seconds"
+    },
+    {
+      "value": 30000,
+      "label": "30 seconds"
+    },
+    {
+      "value": 60000,
+      "label": "1 minute"
+    }
+  ],
+  "showOptions": [
+    {
+      "value": "throughput",
+      "label": "the highest throughput"
+    },
+    {
+      "value": "latency",
+      "label": "the lowest latency"
+    },
+    {
+      "value": "all",
+      "label": "every benchmarked"
+    }
+  ],
+  "defaults": {
+    "model": "Qwen/Qwen3-30B-A3B",
+    "engine": "all",
+    "metric": "ttft",
+    "aggregate": "p95",
+    "sloMs": 1000,
+    "workload": "128;1024",
+    "show": "all"
+  }
+};
+    const palette = [
+      "#c76374",
+      "#6271cc",
+      "#657d37",
+      "#c88c4a",
+      "#7d5ab5",
+      "#4d8c8f"
+    ];
+
+    const modelSelect = document.getElementById("model-select");
+    const engineSelect = document.getElementById("engine-select");
+    const latencySelect = document.getElementById("latency-select");
+    const metricSelect = document.getElementById("metric-select");
+    const sloSelect = document.getElementById("slo-select");
+    const workloadSelect = document.getElementById("workload-select");
+    const showSelect = document.getElementById("show-select");
+    const aggregateSelect = document.getElementById("aggregate-select");
+    const status = document.getElementById("status");
+
+    function populateSelect(select, options, selectedValue) {
+      for (const option of options) {
+        const el = document.createElement("option");
+        el.value = option.value;
+        el.textContent = option.label;
+        if (String(option.value) === String(selectedValue)) {
+          el.selected = true;
+        }
+        select.appendChild(el);
+      }
+    }
+
+    populateSelect(modelSelect, DATA.modelOptions, DATA.defaults.model);
+    populateSelect(engineSelect, DATA.engineOptions, DATA.defaults.engine);
+    populateSelect(latencySelect, DATA.metricOptions, DATA.defaults.metric);
+    populateSelect(metricSelect, DATA.metricOptions.map((option) => ({
+      value: option.value,
+      label: option.chart_label
+    })), DATA.defaults.metric);
+    populateSelect(aggregateSelect, DATA.aggregateOptions, DATA.defaults.aggregate);
+    populateSelect(sloSelect, DATA.sloOptions, DATA.defaults.sloMs);
+    populateSelect(workloadSelect, DATA.workloadOptions, DATA.defaults.workload);
+    populateSelect(showSelect, DATA.showOptions, DATA.defaults.show);
+
+    const metricMeta = Object.fromEntries(DATA.metricOptions.map((option) => [option.value, option]));
+    const chart = new Chart(document.getElementById("benchmark-chart"), {
+      type: "line",
+      data: { datasets: [] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: "nearest", intersect: false },
+        plugins: {
+          legend: {
+            position: "bottom",
+            labels: {
+              usePointStyle: true,
+              boxWidth: 10,
+              font: { family: '"Iowan Old Style", "Palatino Linotype", Georgia, serif', size: 14 }
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label(context) {
+                const value = context.raw;
+                return [
+                  `framework: ${context.dataset.label}`,
+                  `latency: ${value.y.toFixed(3)} s`,
+                  `throughput: ${value.x.toFixed(2)} req/s`
+                ];
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            type: "linear",
+            title: {
+              display: true,
+              text: ["Throughput (requests/s per replica)", "Higher is better ->"],
+              color: "#51623b",
+              font: { family: '"Iowan Old Style", "Palatino Linotype", Georgia, serif', size: 18 }
+            },
+            ticks: {
+              callback(value) {
+                return Number(value).toFixed(1);
+              }
+            },
+            grid: {
+              color: "rgba(125, 129, 112, 0.18)"
+            }
+          },
+          y: {
+            type: "logarithmic",
+            min: 0.001,
+            title: {
+              display: true,
+              text: ["Latency (s)", "<- Lower is better"],
+              color: "#51623b",
+              font: { family: '"Iowan Old Style", "Palatino Linotype", Georgia, serif', size: 18 }
+            },
+            ticks: {
+              callback(value) {
+                const numeric = Number(value);
+                if (numeric >= 1) return numeric.toFixed(0);
+                return numeric.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+              }
+            },
+            grid: {
+              color: "rgba(125, 129, 112, 0.18)"
+            }
+          }
+        }
+      }
+    });
+
+    function syncMetricSelections(source) {
+      const value = source.value;
+      latencySelect.value = value;
+      metricSelect.value = value;
+    }
+
+    function groupKey(point) {
+      return [point.engine, point.gpu_type, point.n_gpu, point.model].join("|");
+    }
+
+    function maybeBestPoints(points, mode, metricKey) {
+      if (mode === "throughput") {
+        return [points.reduce((best, point) => point.throughput_per_replica > best.throughput_per_replica ? point : best)];
+      }
+      if (mode === "latency") {
+        return [points.reduce((best, point) => point[metricKey] < best[metricKey] ? point : best)];
+      }
+      return points;
+    }
+
+    function seriesLabel(point, includeModel) {
+      const base = `${point.engine_label}, ${point.n_gpu} x ${point.gpu_label}`;
+      return includeModel ? `${base}, ${point.model_label}` : base;
+    }
+
+    function render() {
+      syncMetricSelections(latencySelect);
+      const metricKey = metricSelect.value;
+      const aggregateKey = aggregateSelect.value;
+      const valueKey = `${metricKey}_${aggregateKey}`;
+      const selectedModel = modelSelect.value;
+      const selectedEngine = engineSelect.value;
+      const selectedWorkload = workloadSelect.value;
+      const selectedShow = showSelect.value;
+      const visiblePoints = DATA.points.filter((point) => {
+        return (selectedModel === "all" || point.model === selectedModel)
+          && (selectedEngine === "all" || point.engine === selectedEngine)
+          && point.workload_value === selectedWorkload;
+      });
+
+      if (visiblePoints.length === 0) {
+        chart.data.datasets = [];
+        chart.update();
+        status.textContent = "No benchmark points match the selected filters.";
+        return;
+      }
+
+      const includeModelInLegend = new Set(visiblePoints.map((point) => point.model)).size > 1;
+      const grouped = new Map();
+      for (const point of visiblePoints) {
+        const key = groupKey(point);
+        const group = grouped.get(key) ?? [];
+        group.push(point);
+        grouped.set(key, group);
+      }
+
+      const datasets = [];
+      let colorIndex = 0;
+      for (const points of grouped.values()) {
+        points.sort((left, right) => left.throughput_per_replica - right.throughput_per_replica);
+        const chosen = maybeBestPoints(points, selectedShow, valueKey);
+        datasets.push({
+          label: seriesLabel(points[0], includeModelInLegend),
+          data: chosen.map((point) => ({
+            x: point.throughput_per_replica,
+            y: point[valueKey]
+          })),
+          borderColor: palette[colorIndex % palette.length],
+          backgroundColor: palette[colorIndex % palette.length],
+          pointRadius: 4,
+          pointHoverRadius: 5,
+          borderWidth: 3,
+          showLine: chosen.length > 1,
+          tension: 0
+        });
+        colorIndex += 1;
+      }
+
+      chart.data.datasets = datasets;
+      chart.options.scales.y.title.text = [
+        `${metricMeta[metricKey].chart_label} (s)`,
+        "<- Lower is better"
+      ];
+      chart.update();
+    }
+
+    latencySelect.addEventListener("change", () => {
+      syncMetricSelections(latencySelect);
+      render();
+    });
+    metricSelect.addEventListener("change", () => {
+      syncMetricSelections(metricSelect);
+      render();
+    });
+    modelSelect.addEventListener("change", render);
+    engineSelect.addEventListener("change", render);
+    sloSelect.addEventListener("change", render);
+    workloadSelect.addEventListener("change", render);
+    showSelect.addEventListener("change", render);
+    aggregateSelect.addEventListener("change", render);
+
+    render();
+  </script>
+</body>
+</html>
